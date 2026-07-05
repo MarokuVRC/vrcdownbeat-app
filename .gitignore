@@ -1,0 +1,11 @@
+# Build output
+build/
+build-release/
+.vs/
+*.user
+
+# Dev screenshots / UI-automation artifacts (root + tools only;
+# Assets/ images are part of the app and stay tracked)
+/*.png
+shots/
+tools/*.png
