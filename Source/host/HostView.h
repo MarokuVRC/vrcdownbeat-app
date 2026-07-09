@@ -86,6 +86,10 @@ private:
     void appendLog (const juce::String& line);
     void showSendRecordingMenu (const juce::File& folder, const juce::String& song,
                                 juce::Component& anchor);
+    void handleSongOffer (const juce::String& clientName, const juce::var& offer);
+    void handleSongReceived (const juce::String& clientName, const juce::String& songName,
+                             const juce::File& folder, bool ok, const juce::String& error);
+    void updateTalkAutoMute();
     void refreshIpLabel();
     void fetchPublicIp();
     void testPortClicked();
@@ -174,6 +178,12 @@ private:
     juce::Label       talkMicCaption, talkMicHintLabel;
     juce::ComboBox    talkMicBox;
     juce::StringArray talkMicDevices;
+
+    // Auto-mute of the talk mic while a song plays / while a jam runs.
+    juce::ToggleButton muteTalkOnPlayToggle, muteTalkOnJamToggle;
+    bool muteTalkOnPlay { true }, muteTalkOnJam { true };
+    bool talkAutoMuted { false };            ///< the auto-mute is currently engaged
+    bool talkResumeVoice { false }, talkResumeStream { false };
 
     juce::Label      musiciansCaption;
     std::unique_ptr<MusiciansModel> musiciansModel;

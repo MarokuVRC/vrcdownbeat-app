@@ -4,6 +4,43 @@
 
 namespace bandjam
 {
+/** List model for "My songs" - the musician's local, editable library. */
+class MusicianView::LocalSongsModel : public juce::ListBoxModel
+{
+public:
+    explicit LocalSongsModel (MusicianView& o) : owner (o) {}
+
+    int getNumRows() override { return owner.localSongs.getSongs().size(); }
+
+    void paintListBoxItem (int row, juce::Graphics& g, int width, int height, bool selected) override
+    {
+        const auto& songs = owner.localSongs.getSongs();
+        if (! juce::isPositiveAndBelow (row, songs.size()))
+            return;
+
+        if (selected)
+        {
+            g.setColour (style::accentDark().withAlpha (0.5f));
+            g.fillRect (0, 0, width, height);
+        }
+
+        const auto& song = songs.getReference (row);
+        g.setColour (style::textPrimary());
+        g.setFont (style::normalFont());
+        g.drawText (song.name, 8, 0, width - 90, height, juce::Justification::centredLeft);
+
+        g.setColour (style::textDim());
+        g.setFont (juce::Font (juce::FontOptions (12.5f)));
+        g.drawText (juce::String (song.stems.size()) + (song.stems.size() == 1 ? " stem" : " stems"),
+                    width - 86, 0, 80, height, juce::Justification::centredRight);
+    }
+
+    void selectedRowsChanged (int) override { owner.localSelectionChanged(); }
+
+private:
+    MusicianView& owner;
+};
+
 MusicianView::MusicianView()
 {
     // -- header ------------------------------------------------------------------
@@ -94,6 +131,36 @@ MusicianView::MusicianView()
     downloadStatusLabel.setColour (juce::Label::textColourId, style::textDim());
     sessionPage.addAndMakeVisible (downloadStatusLabel);
 
+    // -- "My songs": the local, editable list -------------------------------------
+    style::styleSectionLabel (localSongsCaption, "My songs (local)");
+    sessionPage.addAndMakeVisible (localSongsCaption);
+
+    localModel = std::make_unique<LocalSongsModel> (*this);
+    localList.setModel (localModel.get());
+    localList.setRowHeight (26);
+    sessionPage.addAndMakeVisible (localList);
+
+    localAddButton.setButtonText ("Add...");
+    localAddButton.onClick = [this] { addLocalSongClicked(); };
+    sessionPage.addAndMakeVisible (localAddButton);
+
+    localRemoveButton.setButtonText ("Remove");
+    localRemoveButton.setEnabled (false);
+    localRemoveButton.onClick = [this] { removeLocalSongClicked(); };
+    sessionPage.addAndMakeVisible (localRemoveButton);
+
+    localSendButton.setButtonText ("Send to host");
+    localSendButton.setEnabled (false);
+    localSendButton.onClick = [this] { sendLocalSongClicked(); };
+    sessionPage.addAndMakeVisible (localSendButton);
+
+    localSongs.onChanged = [this]
+    {
+        localList.updateContent();
+        localList.repaint();
+        updateSongButtons();
+    };
+
     // -- player / stems -------------------------------------------------------------
     style::styleSectionLabel (playerCaption, "Player & stem mix");
     sessionPage.addAndMakeVisible (playerCaption);
@@ -171,6 +238,12 @@ MusicianView::MusicianView()
     };
     chatPanel.onTalkToggled = [this] (bool talk)
     {
+        if (talk && talkAutoMuted)
+        {
+            chatPanel.setTalkActive (false);
+            chatPanel.addSystemMessage ("Talk mic is auto-muted right now - turn the toggle off in the Audio tab to talk");
+            return;
+        }
         if (talk && ! voice.isRunning())
             startVoice();
         voice.setTalking (talk && voice.isRunning() && voice.getTalkMicName().isNotEmpty());
@@ -244,6 +317,30 @@ MusicianView::MusicianView()
     talkMicHintLabel.setColour (juce::Label::textColourId, style::textDim());
     talkMicHintLabel.setJustificationType (juce::Justification::topLeft);
     audioPage.addAndMakeVisible (talkMicHintLabel);
+
+    // Auto-mute: keeps the talk mic out of the room while music plays.
+    muteTalkOnPlay = (bool) settings::get ("muteTalkOnPreview", true);
+    muteTalkOnJam  = (bool) settings::get ("muteTalkOnJam", true);
+
+    muteTalkOnPlayToggle.setButtonText ("Auto-mute talk mic while a song plays");
+    muteTalkOnPlayToggle.setToggleState (muteTalkOnPlay, juce::dontSendNotification);
+    muteTalkOnPlayToggle.onClick = [this]
+    {
+        muteTalkOnPlay = muteTalkOnPlayToggle.getToggleState();
+        settings::set ("muteTalkOnPreview", muteTalkOnPlay);
+        updateTalkAutoMute();
+    };
+    audioPage.addAndMakeVisible (muteTalkOnPlayToggle);
+
+    muteTalkOnJamToggle.setButtonText ("Auto-mute talk mic during a jam");
+    muteTalkOnJamToggle.setToggleState (muteTalkOnJam, juce::dontSendNotification);
+    muteTalkOnJamToggle.onClick = [this]
+    {
+        muteTalkOnJam = muteTalkOnJamToggle.getToggleState();
+        settings::set ("muteTalkOnJam", muteTalkOnJam);
+        updateTalkAutoMute();
+    };
+    audioPage.addAndMakeVisible (muteTalkOnJamToggle);
 
     refreshTalkMicDevices();
 
@@ -496,6 +593,37 @@ MusicianView::MusicianView()
         safe->chatPanel.addSystemMessage (ok ? "Recording received: " + recId
                                              : "Recording transfer failed: " + error);
     };
+    connection.onSongOfferAnswer = [safe] (bool accepted)
+    {
+        if (safe == nullptr) return;
+        if (accepted)
+        {
+            safe->downloadStatusLabel.setText ("Host accepted - uploading...", juce::dontSendNotification);
+        }
+        else
+        {
+            safe->songUploadActive = false;
+            safe->downloadStatusLabel.setText ("The host declined the song.", juce::dontSendNotification);
+            safe->updateSongButtons();
+        }
+    };
+    connection.onSongUploadProgress = [safe] (juce::int64 sent, juce::int64 total)
+    {
+        if (safe == nullptr) return;
+        auto mb = [] (juce::int64 bytes) { return juce::String ((double) bytes / (1024.0 * 1024.0), 1); };
+        safe->downloadStatusLabel.setText ("Uploading... " + mb (sent)
+                                           + (total > 0 ? " / " + mb (total) : juce::String()) + " MB",
+                                           juce::dontSendNotification);
+    };
+    connection.onSongUploadEnd = [safe] (bool ok, const juce::String& error)
+    {
+        if (safe == nullptr) return;
+        safe->songUploadActive = false;
+        safe->downloadStatusLabel.setText (ok ? juce::String ("Song sent - it is now in the host's library.")
+                                              : "Upload failed: " + error,
+                                           juce::dontSendNotification);
+        safe->updateSongButtons();
+    };
     connection.onVoiceBlock = [this] (const juce::String& speaker, const juce::int16* samples, int numSamples)
     {
         voice.receiveVoice (speaker, samples, numSamples);   // reader thread - VoiceChat locks internally
@@ -620,6 +748,7 @@ MusicianView::~MusicianView()
     engine.saveInstrumentState();
     connection.disconnect();
     songsList.setModel (nullptr);
+    localList.setModel (nullptr);
 }
 
 //==============================================================================
@@ -674,16 +803,35 @@ void MusicianView::layoutSessionPage()
     area.removeFromRight (12);
     auto mid = area;
 
-    // Left: songs
+    // Left: songs from the host (top) + the local "My songs" list (bottom),
+    // sharing one status line at the very bottom.
     songsCaption.setBounds (left.removeFromTop (24));
     left.removeFromTop (4);
     downloadStatusLabel.setBounds (left.removeFromBottom (22));
-    auto dlRow = left.removeFromBottom (30);
+    left.removeFromBottom (4);
+
+    auto hostArea = left.removeFromTop ((left.getHeight() - 8) / 2);
+    left.removeFromTop (8);
+    auto localArea = left;
+
+    auto dlRow = hostArea.removeFromBottom (30);
     downloadButton.setBounds (dlRow.removeFromLeft ((dlRow.getWidth() - 6) / 2));
     dlRow.removeFromLeft (6);
     deleteButton.setBounds (dlRow);
-    left.removeFromBottom (6);
-    songsList.setBounds (left);
+    hostArea.removeFromBottom (6);
+    songsList.setBounds (hostArea);
+
+    localSongsCaption.setBounds (localArea.removeFromTop (24));
+    localArea.removeFromTop (4);
+    auto localRow = localArea.removeFromBottom (30);
+    const int localButtonWidth = (localRow.getWidth() - 12) / 3;
+    localAddButton.setBounds (localRow.removeFromLeft (localButtonWidth));
+    localRow.removeFromLeft (6);
+    localRemoveButton.setBounds (localRow.removeFromLeft (localButtonWidth));
+    localRow.removeFromLeft (6);
+    localSendButton.setBounds (localRow);
+    localArea.removeFromBottom (6);
+    localList.setBounds (localArea);
 
     // Mid: player + jam
     playerCaption.setBounds (mid.removeFromTop (24));
@@ -739,8 +887,8 @@ void MusicianView::layoutAudioPage()
     left.removeFromTop (4);
 
     // Fixed-height selector (its content doesn't scroll); reserve enough room
-    // below it for latency + offset + ASIO hint + the talk mic selector.
-    deviceSelector->setBounds (left.removeFromTop (juce::jmax (230, left.getHeight() - 215)));
+    // below it for latency + offset + ASIO hint + talk mic + auto-mute toggles.
+    deviceSelector->setBounds (left.removeFromTop (juce::jmax (230, left.getHeight() - 270)));
     left.removeFromTop (4);
     latencyLabel.setBounds (left.removeFromTop (54));
     left.removeFromTop (4);
@@ -756,6 +904,10 @@ void MusicianView::layoutAudioPage()
     talkMicBox.setBounds (talkRow);
     left.removeFromTop (4);
     talkMicHintLabel.setBounds (left.removeFromTop (34));
+    left.removeFromTop (4);
+    muteTalkOnPlayToggle.setBounds (left.removeFromTop (24));
+    left.removeFromTop (2);
+    muteTalkOnJamToggle.setBounds (left.removeFromTop (24));
 
     // Right column: instrument (VST3) + MIDI.
     auto inst = right;
@@ -831,12 +983,24 @@ void MusicianView::paintListBoxItem (int row, juce::Graphics& g, int width, int 
 
 void MusicianView::selectedRowsChanged (int)
 {
+    // Only one of the two song lists carries a selection at a time.
+    if (! syncingSelection && songsList.getSelectedRow() >= 0)
+    {
+        syncingSelection = true;
+        localList.deselectAllRows();
+        syncingSelection = false;
+    }
+
     // While a song is loaded the player (title + strips) belongs to it -
     // selecting another row must not steal the mix controls of what is playing.
     if (const auto* loadedSong = downloads.findSong (engine.getLoadedSongId()))
         songTitleLabel.setText (loadedSong->name, juce::dontSendNotification);
+    else if (const auto* loadedLocal = localSongs.findSong (engine.getLoadedSongId()))
+        songTitleLabel.setText (loadedLocal->name + " (local)", juce::dontSendNotification);
     else if (const auto* song = selectedSong())
         songTitleLabel.setText (song->name, juce::dontSendNotification);
+    else if (const auto* local = selectedLocalSong())
+        songTitleLabel.setText (local->name + " (local)", juce::dontSendNotification);
     else
         songTitleLabel.setText ("No song selected", juce::dontSendNotification);
 
@@ -844,21 +1008,43 @@ void MusicianView::selectedRowsChanged (int)
     rebuildStemStrips();
 }
 
+void MusicianView::localSelectionChanged()
+{
+    if (! syncingSelection && localList.getSelectedRow() >= 0)
+    {
+        syncingSelection = true;
+        songsList.deselectAllRows();
+        syncingSelection = false;
+    }
+    selectedRowsChanged (0);   // shared refresh: title, buttons, strips
+}
+
 void MusicianView::updateSongButtons()
 {
-    const auto* song = selectedSong();
-    const bool idle  = jamPhase == JamPhase::idle && ! downloadActive;
+    const auto* song  = selectedSong();
+    const auto* local = selectedLocalSong();
+    const bool idle   = jamPhase == JamPhase::idle && ! downloadActive;
 
     downloadButton.setEnabled (song != nullptr && connection.isConnected()
                                && idle && ! song->isComplete());
     deleteButton.setEnabled (song != nullptr && idle && song->numDownloaded() > 0);
-    loadButton.setEnabled (song != nullptr && song->isComplete() && idle);
+    loadButton.setEnabled (idle && ((song != nullptr && song->isComplete()) || local != nullptr));
+
+    localRemoveButton.setEnabled (local != nullptr && idle);
+    localSendButton.setEnabled (local != nullptr && connection.isConnected() && ! songUploadActive);
 }
 
 const LocalSong* MusicianView::selectedSong() const
 {
     const int row = songsList.getSelectedRow();
     const auto& songs = downloads.getSongs();
+    return juce::isPositiveAndBelow (row, songs.size()) ? &songs.getReference (row) : nullptr;
+}
+
+const LibrarySong* MusicianView::selectedLocalSong() const
+{
+    const int row = localList.getSelectedRow();
+    const auto& songs = localSongs.getSongs();
     return juce::isPositiveAndBelow (row, songs.size()) ? &songs.getReference (row) : nullptr;
 }
 
@@ -923,6 +1109,7 @@ void MusicianView::handleDisconnected (const juce::String& reason)
     countdownLabel.setVisible (false);
     downloadQueue.clear();
     downloadActive = false;
+    songUploadActive = false;
 
     connStatusLabel.setText (reason, juce::dontSendNotification);
     connStatusLabel.setColour (juce::Label::textColourId, style::warn());
@@ -1033,6 +1220,103 @@ void MusicianView::deleteClicked()
     updateTransportButtons();
 }
 
+//==============================================================================
+// "My songs": the local, editable list
+void MusicianView::addLocalSongClicked()
+{
+    songChooser = std::make_unique<juce::FileChooser> (
+        "Choose the audio files (stems) for the song",
+        juce::File::getSpecialLocation (juce::File::userMusicDirectory),
+        "*.wav;*.mp3;*.flac;*.aiff;*.aif;*.ogg");
+
+    songChooser->launchAsync (juce::FileBrowserComponent::openMode
+                              | juce::FileBrowserComponent::canSelectFiles
+                              | juce::FileBrowserComponent::canSelectMultipleItems,
+        [this] (const juce::FileChooser& chooser)
+        {
+            juce::Array<juce::File> files = chooser.getResults();
+            if (files.isEmpty())
+                return;
+
+            const auto defaultName = files[0].getParentDirectory().getFileName();
+
+            auto* window = new juce::AlertWindow ("Add song", "Song name:",
+                                                  juce::MessageBoxIconType::NoIcon);
+            window->addTextEditor ("name", defaultName);
+            window->addButton ("OK", 1, juce::KeyPress (juce::KeyPress::returnKey));
+            window->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+
+            juce::Component::SafePointer<MusicianView> safe (this);
+            window->enterModalState (true,
+                juce::ModalCallbackFunction::create ([safe, window, files] (int result)
+                {
+                    if (safe == nullptr || result != 1)
+                        return;
+
+                    const auto name = window->getTextEditorContents ("name");
+                    juce::String error;
+                    if (safe->localSongs.addSong (name, files, error).isEmpty())
+                        safe->downloadStatusLabel.setText ("Import failed: " + error, juce::dontSendNotification);
+                    else
+                        safe->downloadStatusLabel.setText ("\"" + name.trim() + "\" added to My songs.",
+                                                           juce::dontSendNotification);
+                }),
+                true);
+        });
+}
+
+void MusicianView::removeLocalSongClicked()
+{
+    const auto* local = selectedLocalSong();
+    if (local == nullptr || jamPhase != JamPhase::idle)
+        return;
+
+    const auto songId = local->id;
+    const auto name   = local->name;
+
+    if (engine.getLoadedSongId() == songId)
+    {
+        engine.unload();
+        songTitleLabel.setText ("No song selected", juce::dontSendNotification);
+    }
+
+    localSongs.removeSong (songId);
+    downloadStatusLabel.setText ("\"" + name + "\" removed.", juce::dontSendNotification);
+    selectedRowsChanged (0);
+    updateTransportButtons();
+}
+
+void MusicianView::sendLocalSongClicked()
+{
+    const auto* local = selectedLocalSong();
+    if (local == nullptr || songUploadActive)
+        return;
+
+    if (! connection.isConnected())
+    {
+        downloadStatusLabel.setText ("Connect to a host first.", juce::dontSendNotification);
+        return;
+    }
+
+    juce::Array<juce::File> files;
+    for (const auto& stem : local->stems)
+        files.add (local->folder.getChildFile (stem.fileName));
+
+    if (connection.offerSong (local->name, files))
+    {
+        songUploadActive = true;
+        downloadStatusLabel.setText ("Waiting for the host to accept \"" + local->name + "\"...",
+                                     juce::dontSendNotification);
+    }
+    else
+    {
+        downloadStatusLabel.setText ("Could not offer the song (another upload running?).",
+                                     juce::dontSendNotification);
+    }
+    updateSongButtons();
+}
+
+//==============================================================================
 void MusicianView::startNextDownload()
 {
     if (downloadQueue.isEmpty())
@@ -1087,10 +1371,49 @@ void MusicianView::rebuildStemStrips()
     stemStripIds.clear();
 
     // The strips control what you hear: the loaded song while one is loaded
-    // (regardless of the list selection), otherwise the selected song.
+    // (regardless of the list selection), otherwise the selected song. Both
+    // song lists (host downloads and the local "My songs") are considered.
     const auto* song = downloads.findSong (engine.getLoadedSongId());
+    const LibrarySong* local = nullptr;
     if (song == nullptr)
+        local = localSongs.findSong (engine.getLoadedSongId());
+    if (song == nullptr && local == nullptr)
+    {
         song = selectedSong();
+        if (song == nullptr)
+            local = selectedLocalSong();
+    }
+
+    // Local song: the mix is live-only (defaults each time - not persisted).
+    if (local != nullptr)
+    {
+        const auto songId = local->id;
+        for (int i = 0; i < local->stems.size(); ++i)
+        {
+            const auto& stem = local->stems.getReference (i);
+            auto* strip = new ChannelStrip (stem.name);
+            strip->setValues (0.0f, false);
+            strip->setInfoText ("local");
+
+            const int index = i;
+            strip->onGain = [this, songId, index] (float db)
+            {
+                if (engine.getLoadedSongId() == songId)
+                    engine.setStemGainDb (index, db);
+            };
+            strip->onMute = [this, songId, index] (bool mute)
+            {
+                if (engine.getLoadedSongId() == songId)
+                    engine.setStemMute (index, mute);
+            };
+
+            stemsContainer.addAndMakeVisible (strip);
+            stemStrips.add (strip);
+            stemStripIds.add (stem.id);
+        }
+        layoutStemStrips();
+        return;
+    }
 
     if (song == nullptr)
     {
@@ -1157,8 +1480,17 @@ void MusicianView::layoutStemStrips()
 
 void MusicianView::loadSelectedSong()
 {
+    if (jamPhase != JamPhase::idle)
+        return;
+
+    if (const auto* local = selectedLocalSong())
+    {
+        loadLocalSong (*local);
+        return;
+    }
+
     const auto* song = selectedSong();
-    if (song == nullptr || jamPhase != JamPhase::idle)
+    if (song == nullptr)
         return;
 
     const double targetRate = engine.getDeviceSampleRate();
@@ -1195,6 +1527,56 @@ void MusicianView::loadSelectedSong()
             safe->songTitleLabel.setText (error, juce::dontSendNotification);
         }
         safe->rebuildStemStrips();   // the strips now control the loaded song
+        safe->updateSongButtons();
+        safe->updateTransportButtons();
+    });
+}
+
+void MusicianView::loadLocalSong (const LibrarySong& song)
+{
+    const double targetRate = engine.getDeviceSampleRate();
+    if (targetRate <= 0.0)
+    {
+        songTitleLabel.setText ("No audio device active.", juce::dontSendNotification);
+        return;
+    }
+
+    songTitleLabel.setText ("Loading \"" + song.name + "\" ...", juce::dontSendNotification);
+    loadButton.setEnabled (false);
+
+    std::vector<songloader::StemRequest> requests;
+    for (const auto& stem : song.stems)
+        requests.push_back ({ song.folder.getChildFile (stem.fileName), stem.name, 0.0f, false });
+
+    LocalSong meta;
+    meta.id            = song.id;
+    meta.name          = song.name;
+    meta.sampleRate    = song.sampleRate;
+    meta.lengthSamples = song.lengthSamples;
+
+    const int generation = ++loadGeneration;
+    juce::Component::SafePointer<MusicianView> safe (this);
+
+    songloader::decodeAsync (std::move (requests), targetRate,
+                             [safe, generation, meta] (std::shared_ptr<songloader::Result> result)
+    {
+        if (safe == nullptr || generation != safe->loadGeneration)
+            return;
+
+        juce::String error = result->ok ? juce::String() : result->error;
+        if (error.isEmpty())
+            safe->engine.adoptSong (meta, std::move (result->stems), error);
+
+        if (error.isEmpty())
+        {
+            safe->songTitleLabel.setText (meta.name + " (local)", juce::dontSendNotification);
+            safe->positionSlider.setRange (0.0, juce::jmax (0.1, safe->engine.getLengthSeconds()), 0.01);
+        }
+        else
+        {
+            safe->songTitleLabel.setText (error, juce::dontSendNotification);
+        }
+        safe->rebuildStemStrips();
         safe->updateSongButtons();
         safe->updateTransportButtons();
     });
@@ -1509,8 +1891,55 @@ void MusicianView::loadInstrumentClicked()
 }
 
 //==============================================================================
+void MusicianView::updateTalkAutoMute()
+{
+    const bool songPlaying = engine.isPreviewPlaying();
+    const bool jamActive   = jamPhase == JamPhase::countdown || jamPhase == JamPhase::running;
+    const bool shouldMute  = (muteTalkOnPlay && songPlaying) || (muteTalkOnJam && jamActive);
+
+    if (shouldMute == talkAutoMuted)
+        return;
+    talkAutoMuted = shouldMute;
+
+    if (shouldMute)
+    {
+        // Remember what was on so we can restore it afterwards.
+        talkResumeVoice  = voice.isTalking();
+        talkResumeStream = engine.getStreamOutput().isTalkEnabled();
+
+        if (talkResumeVoice)
+        {
+            voice.setTalking (false);
+            chatPanel.setTalkActive (false);
+        }
+        if (talkResumeStream)
+            engine.getStreamOutput().setTalkEnabled (false);
+
+        if (talkResumeVoice || talkResumeStream)
+            chatPanel.addSystemMessage (songPlaying ? "Talk mic auto-muted while the song plays"
+                                                    : "Talk mic auto-muted during the jam");
+    }
+    else
+    {
+        if (talkResumeStream)
+            engine.getStreamOutput().setTalkEnabled (true);
+        if (talkResumeVoice && voice.isRunning() && voice.getTalkMicName().isNotEmpty())
+        {
+            voice.setTalking (true);
+            chatPanel.setTalkActive (true);
+        }
+        if (talkResumeVoice || talkResumeStream)
+            chatPanel.addSystemMessage ("Talk mic re-enabled");
+
+        talkResumeVoice = talkResumeStream = false;
+    }
+}
+
+//==============================================================================
 void MusicianView::timerCallback()
 {
+    updateTalkAutoMute();
+
     if (jamPhase == JamPhase::countdown)
     {
         const auto now = juce::Time::getMillisecondCounter();

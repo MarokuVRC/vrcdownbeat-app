@@ -4,6 +4,8 @@
 #include "musician/DownloadStore.h"
 #include "musician/HostConnection.h"
 #include "musician/PlayCaptureEngine.h"
+#include "host/SongLibrary.h"
+#include "common/AppPaths.h"
 #include "common/SongLoader.h"
 #include "common/VoiceChat.h"
 #include "ui/Meters.h"
@@ -40,6 +42,8 @@ public:
 private:
     enum class JamPhase { idle, downloading, loading, ready, countdown, running };
 
+    class LocalSongsModel;
+
     void timerCallback() override;
 
     void toggleConnect();
@@ -54,8 +58,15 @@ private:
     void rebuildStemStrips();
     void layoutStemStrips();
     void loadSelectedSong();
+    void loadLocalSong (const LibrarySong& song);
     void updateTransportButtons();
     void updateSongButtons();
+
+    void localSelectionChanged();
+    void addLocalSongClicked();
+    void removeLocalSongClicked();
+    void sendLocalSongClicked();
+    const LibrarySong* selectedLocalSong() const;
 
     void handleJamPrepare (const juce::var& json);
     void continueJamPreparation();
@@ -76,6 +87,7 @@ private:
     void refreshTalkMicDevices();
     void startVoice();
     void stopVoice();
+    void updateTalkAutoMute();
     void handleRecordingOffer (const juce::var& offer);
 
     const LocalSong* selectedSong() const;
@@ -84,6 +96,7 @@ private:
 
     // Destruction order: engine last (its sender thread uses connection).
     DownloadStore     downloads;
+    SongLibrary       localSongs { paths::localSongsRoot() };   ///< "My songs": local, editable
     HostConnection    connection;
     PlayCaptureEngine engine;
     VoiceChat         voice;      ///< band talk (sender thread uses connection too)
@@ -121,6 +134,16 @@ private:
     juce::ListBox    songsList { "songs", this };
     juce::TextButton downloadButton, deleteButton;
 
+    // "My songs": a second, locally editable list. Songs can be previewed
+    // and offered to the host (who has to accept before the upload starts).
+    juce::Label      localSongsCaption;
+    std::unique_ptr<LocalSongsModel> localModel;
+    juce::ListBox    localList { "localsongs", nullptr };
+    juce::TextButton localAddButton, localRemoveButton, localSendButton;
+    std::unique_ptr<juce::FileChooser> songChooser;
+    bool syncingSelection { false };   ///< guards the two lists' mutual deselect
+    bool songUploadActive { false };
+
     juce::Label      playerCaption, songTitleLabel, timeLabel;
     juce::TextButton loadButton, playButton, stopButton;
     juce::Slider     positionSlider { juce::Slider::LinearHorizontal, juce::Slider::TextBoxRight };
@@ -142,6 +165,12 @@ private:
     juce::Label       talkMicCaption, talkMicHintLabel;
     juce::ComboBox    talkMicBox;
     juce::StringArray talkMicDevices;
+
+    // Auto-mute of the talk mic while a song plays / while a jam runs.
+    juce::ToggleButton muteTalkOnPlayToggle, muteTalkOnJamToggle;
+    bool muteTalkOnPlay { true }, muteTalkOnJam { true };
+    bool talkAutoMuted { false };
+    bool talkResumeVoice { false }, talkResumeStream { false };
 
     juce::Label      instCaption, instStatusLabel, midiCaption, midiActivityLabel;
     juce::TextButton instLoadButton, instUiButton, instRemoveButton, midiRescanButton;

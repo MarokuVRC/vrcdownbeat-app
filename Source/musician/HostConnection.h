@@ -49,6 +49,11 @@ public:
         host streams the folder; files land under appdata/recordings/<recId>. */
     bool sendRecordingAnswer (const juce::String& recId, bool accept);
 
+    /** Offers a song (its audio files) to the host. The host must accept
+        (onSongOfferAnswer); the files then stream on a dedicated sender
+        thread. One offer at a time. Message thread. */
+    bool offerSong (const juce::String& name, const juce::Array<juce::File>& files);
+
     // -- events (message thread) ------------------------------------------------
     std::function<void (const juce::String& hostName)> onConnected;
     std::function<void (const juce::String& reason)>   onDisconnected;
@@ -71,17 +76,26 @@ public:
     std::function<void (const juce::String& recId, bool ok, const juce::String& error,
                         const juce::File& folder)> onRecordingEnd;
 
+    /** The host answered our song offer (accepted starts the upload). */
+    std::function<void (bool accepted)> onSongOfferAnswer;
+    std::function<void (juce::int64 sentBytes, juce::int64 totalBytes)> onSongUploadProgress;
+    std::function<void (bool ok, const juce::String& error)> onSongUploadEnd;
+
     /** Reader thread (live path): a remote speaker's voice block. */
     std::function<void (const juce::String& speakerName,
                         const juce::int16* samples, int numSamples)> onVoiceBlock;
 
 private:
+    class SongUploader;
+
     void run() override;
     bool sendBlock (MsgType type, juce::int64 startSample, const float* mono, int numSamples);
+    bool sendRawBytes (MsgType type, const void* data, juce::uint32 bytes);
     bool performHandshake (juce::String& failReason);
     void handleMessage (const Message& msg);
     void finishTransfer (bool ok, const juce::String& error,
                          const juce::String& songId, const juce::String& stemId);
+    void runSongUpload (juce::Thread& runner);
 
     template <typename Fn>
     static void onMessageThread (Fn&& fn) { juce::MessageManager::callAsync (std::forward<Fn> (fn)); }
@@ -114,6 +128,14 @@ private:
     juce::int64  recReceivedBytes { 0 };
     juce::int64  recTotalBytes    { 0 };
     juce::uint32 recLastProgressMs { 0 };
+
+    // Outgoing song upload (offer set on the message thread, files streamed
+    // by the SongUploader thread once the host accepts).
+    juce::CriticalSection uploadLock;
+    juce::String upOfferId, upSongName;
+    juce::Array<juce::File> upFiles;
+    juce::int64 upTotalBytes { 0 };
+    std::unique_ptr<SongUploader> songUploader;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (HostConnection)
 };

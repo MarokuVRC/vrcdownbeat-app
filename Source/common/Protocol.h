@@ -79,6 +79,14 @@ enum class MsgType : juce::uint16
     recordingChunk     = 54, ///< H->M binary: raw file bytes of the current transfer
     recordingFileEnd   = 55, ///< H->M JSON { recId, fileName, ok }
     recordingEnd       = 56, ///< H->M JSON { recId, ok, error }
+
+    // Song upload (musician -> host, host must accept the offer first) -------------
+    songOffer     = 60, ///< M->H JSON { offerId, name, numFiles, totalBytes }
+    songAnswer    = 61, ///< H->M JSON { offerId, accept }
+    songFileBegin = 62, ///< M->H JSON { offerId, fileName, fileSize, fileIndex, numFiles }
+    songChunk     = 63, ///< M->H binary: raw file bytes of the current transfer
+    songFileEnd   = 64, ///< M->H JSON { offerId, fileName, ok }
+    songEnd       = 65, ///< M->H JSON { offerId, ok, error }
 };
 
 /** Fixed sample rate of the band voice chat (mono, resampled on both ends). */

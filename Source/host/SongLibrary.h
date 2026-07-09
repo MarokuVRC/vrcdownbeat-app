@@ -24,12 +24,14 @@ struct LibrarySong
     juce::File   folder;
 };
 
-/** The host's song library: each song is a folder under appdata/library with
-    the stem audio files and a song.json manifest. Message-thread only. */
+/** A song library: each song is a folder under the given root with the stem
+    audio files and a song.json manifest. The host uses appdata/library; the
+    musician's local "My songs" list uses appdata/mysongs. Message-thread only. */
 class SongLibrary
 {
 public:
-    SongLibrary();
+    /** Default root = the host's library (appdata/library). */
+    explicit SongLibrary (const juce::File& rootFolder = juce::File());
 
     const juce::Array<LibrarySong>& getSongs() const noexcept { return songs; }
     const LibrarySong* findSong (const juce::String& songId) const;
@@ -55,6 +57,7 @@ private:
     void load();
     void saveManifest (const LibrarySong& song) const;
 
+    juce::File root;
     juce::AudioFormatManager formatManager;
     juce::Array<LibrarySong> songs;
 

@@ -443,6 +443,12 @@ HostView::HostView()
     };
     chatPanel.onTalkToggled = [this] (bool talk)
     {
+        if (talk && talkAutoMuted)
+        {
+            chatPanel.setTalkActive (false);
+            chatPanel.addSystemMessage ("Talk mic is auto-muted right now - turn the toggle off in the Audio tab to talk");
+            return;
+        }
         if (talk && ! voice.isRunning())
             startVoice();
         voice.setTalking (talk && voice.isRunning() && voice.getTalkMicName().isNotEmpty());
@@ -522,6 +528,15 @@ HostView::HostView()
                                      const juce::String& state, int percent, const juce::String& error)
     {
         if (safe != nullptr) safe->handlePrepareStatus (name, id, state, percent, error);
+    };
+    server.onSongOffer = [safe] (const juce::String& clientName, juce::var offer)
+    {
+        if (safe != nullptr) safe->handleSongOffer (clientName, offer);
+    };
+    server.onSongReceived = [safe] (const juce::String& clientName, const juce::String& songName,
+                                    juce::File folder, bool ok, const juce::String& error)
+    {
+        if (safe != nullptr) safe->handleSongReceived (clientName, songName, folder, ok, error);
     };
 
     relayLink.onRoomOpened = [safe] (const juce::String& code)
@@ -726,6 +741,10 @@ void HostView::layoutAudioPage()
     talkMicBox.setBounds (talkRow);
     right.removeFromTop (4);
     talkMicHintLabel.setBounds (right.removeFromTop (34));
+    right.removeFromTop (8);
+    muteTalkOnPlayToggle.setBounds (right.removeFromTop (24));
+    right.removeFromTop (2);
+    muteTalkOnJamToggle.setBounds (right.removeFromTop (24));
 }
 
 void HostView::layoutStreamPage()
@@ -764,6 +783,30 @@ void HostView::initTalkMicControls()
     talkMicHintLabel.setColour (juce::Label::textColourId, style::textDim());
     talkMicHintLabel.setJustificationType (juce::Justification::topLeft);
     audioPage.addAndMakeVisible (talkMicHintLabel);
+
+    // Auto-mute: keeps the talk mic out of the room while music plays.
+    muteTalkOnPlay = (bool) settings::get ("muteTalkOnPreview", true);
+    muteTalkOnJam  = (bool) settings::get ("muteTalkOnJam", true);
+
+    muteTalkOnPlayToggle.setButtonText ("Auto-mute talk mic while a song plays");
+    muteTalkOnPlayToggle.setToggleState (muteTalkOnPlay, juce::dontSendNotification);
+    muteTalkOnPlayToggle.onClick = [this]
+    {
+        muteTalkOnPlay = muteTalkOnPlayToggle.getToggleState();
+        settings::set ("muteTalkOnPreview", muteTalkOnPlay);
+        updateTalkAutoMute();
+    };
+    audioPage.addAndMakeVisible (muteTalkOnPlayToggle);
+
+    muteTalkOnJamToggle.setButtonText ("Auto-mute talk mic during a jam");
+    muteTalkOnJamToggle.setToggleState (muteTalkOnJam, juce::dontSendNotification);
+    muteTalkOnJamToggle.onClick = [this]
+    {
+        muteTalkOnJam = muteTalkOnJamToggle.getToggleState();
+        settings::set ("muteTalkOnJam", muteTalkOnJam);
+        updateTalkAutoMute();
+    };
+    audioPage.addAndMakeVisible (muteTalkOnJamToggle);
 
     refreshTalkMicDevices();
 }
@@ -1666,6 +1709,52 @@ void HostView::timerCallback()
     if (phase == Phase::preparing || phase == Phase::running)
         if (++stateBroadcastTick % 30 == 0)
             broadcastJamState();
+
+    updateTalkAutoMute();
+}
+
+void HostView::updateTalkAutoMute()
+{
+    const bool songPlaying = engine.isPreviewPlaying();
+    const bool jamActive   = phase == Phase::countdown || phase == Phase::running;
+    const bool shouldMute  = (muteTalkOnPlay && songPlaying) || (muteTalkOnJam && jamActive);
+
+    if (shouldMute == talkAutoMuted)
+        return;
+    talkAutoMuted = shouldMute;
+
+    if (shouldMute)
+    {
+        // Remember what was on so we can restore it afterwards.
+        talkResumeVoice  = voice.isTalking();
+        talkResumeStream = engine.getStreamOutput().isTalkEnabled();
+
+        if (talkResumeVoice)
+        {
+            voice.setTalking (false);
+            chatPanel.setTalkActive (false);
+        }
+        if (talkResumeStream)
+            engine.getStreamOutput().setTalkEnabled (false);
+
+        if (talkResumeVoice || talkResumeStream)
+            chatPanel.addSystemMessage (songPlaying ? "Talk mic auto-muted while the song plays"
+                                                    : "Talk mic auto-muted during the jam");
+    }
+    else
+    {
+        if (talkResumeStream)
+            engine.getStreamOutput().setTalkEnabled (true);
+        if (talkResumeVoice && voice.isRunning() && voice.getTalkMicName().isNotEmpty())
+        {
+            voice.setTalking (true);
+            chatPanel.setTalkActive (true);
+        }
+        if (talkResumeVoice || talkResumeStream)
+            chatPanel.addSystemMessage ("Talk mic re-enabled");
+
+        talkResumeVoice = talkResumeStream = false;
+    }
 }
 
 void HostView::appendLog (const juce::String& line)
@@ -1720,6 +1809,60 @@ void HostView::showSendRecordingMenu (const juce::File& folder, const juce::Stri
                 safe->recordingsPanel->showStatus ("Could not offer the recording (musician disconnected?).", true);
         }
     });
+}
+
+//==============================================================================
+void HostView::handleSongOffer (const juce::String& clientName, const juce::var& offer)
+{
+    const auto offerId  = offer.getProperty ("offerId", juce::String()).toString();
+    const auto songName = offer.getProperty ("name", juce::String()).toString();
+    const int  numFiles = (int) offer.getProperty ("numFiles", 0);
+    const auto bytes    = (juce::int64) offer.getProperty ("totalBytes", 0);
+    if (offerId.isEmpty() || songName.isEmpty())
+        return;
+
+    const auto sizeText = juce::String ((double) bytes / (1024.0 * 1024.0), 1) + " MB";
+    appendLog (clientName + " wants to send the song \"" + songName + "\" (" + sizeText + ")");
+
+    juce::Component::SafePointer<HostView> safe (this);
+    juce::NativeMessageBox::showOkCancelBox (juce::MessageBoxIconType::QuestionIcon,
+        "Receive song?",
+        clientName + " wants to send you the song\n\"" + songName + "\"\n("
+            + juce::String (numFiles) + (numFiles == 1 ? " file, " : " files, ") + sizeText
+            + ").\n\nAccept it and add it to your library?",
+        this, juce::ModalCallbackFunction::create ([safe, clientName, offerId, songName] (int okPressed)
+    {
+        if (safe == nullptr)
+            return;
+
+        if (! safe->server.answerSongOffer (clientName, offerId, okPressed != 0))
+            safe->appendLog ("Could not answer the song offer (musician disconnected?)");
+        else if (okPressed != 0)
+            safe->appendLog ("Receiving \"" + songName + "\" from " + clientName + "...");
+        else
+            safe->appendLog ("Song \"" + songName + "\" from " + clientName + " declined");
+    }));
+}
+
+void HostView::handleSongReceived (const juce::String& clientName, const juce::String& songName,
+                                   const juce::File& folder, bool ok, const juce::String& error)
+{
+    if (! ok)
+    {
+        appendLog ("Receiving \"" + songName + "\" from " + clientName + " failed: "
+                   + (error.isNotEmpty() ? error : "unknown error"));
+        return;
+    }
+
+    const auto files = folder.findChildFiles (juce::File::findFiles, false);
+    juce::String importError;
+    if (library.addSong (songName, files, importError).isEmpty())
+        appendLog ("Import of \"" + songName + "\" failed: " + importError);
+    else
+        appendLog ("Song \"" + songName + "\" received from " + clientName
+                   + " and added to the library.");   // onChanged broadcasts the new list
+
+    folder.deleteRecursively();
 }
 
 } // namespace bandjam

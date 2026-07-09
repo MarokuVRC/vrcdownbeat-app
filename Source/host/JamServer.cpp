@@ -1,4 +1,5 @@
 #include "JamServer.h"
+#include "common/AppPaths.h"
 #include <juce_events/juce_events.h>
 #include <map>
 #include <vector>
@@ -23,6 +24,10 @@ public:
             recSender->stopThread (4000);
         socket->close();
         stopThread (4000);
+
+        // A half-received song upload leaves a ".part" temp folder behind.
+        if (upTempFolder != juce::File())
+            upTempFolder.deleteRecursively();
     }
 
     juce::String getName() const
@@ -65,6 +70,28 @@ public:
         obj->setProperty ("numFiles", numFiles);
         obj->setProperty ("totalBytes", totalBytes);
         return sendJson (MsgType::recordingOffer, juce::var (obj));
+    }
+
+    /** Message thread: answers a musician's song offer. On accept, the file
+        messages that follow are written to a temp folder; onSongReceived
+        fires when the upload completes. */
+    bool answerSongOffer (const juce::String& offerId, bool accept)
+    {
+        {
+            const juce::ScopedLock sl (metaLock);
+            const auto it = songOffers.find (offerId);
+            if (it == songOffers.end())
+                return false;
+            if (accept)
+                it->second.accepted = true;
+            else
+                songOffers.erase (it);
+        }
+
+        auto* obj = new juce::DynamicObject();
+        obj->setProperty ("offerId", offerId);
+        obj->setProperty ("accept", accept);
+        return sendJson (MsgType::songAnswer, juce::var (obj));
     }
 
     bool sendJson (MsgType type, const juce::var& json)
@@ -268,6 +295,112 @@ private:
                 return true;
             }
 
+            // -- song upload (musician -> host) ------------------------------------
+            case MsgType::songOffer:
+            {
+                const auto json    = msg.parseJson();
+                const auto offerId = json.getProperty ("offerId", juce::String()).toString();
+                const auto reqName = json.getProperty ("name", juce::String()).toString().trim();
+                if (offerId.isEmpty() || reqName.isEmpty())
+                    return true;
+
+                {
+                    const juce::ScopedLock sl (metaLock);
+                    songOffers[offerId] = { reqName, false };
+                }
+
+                const auto who = getName();
+                if (auto cb = server.onSongOffer)
+                    juce::MessageManager::callAsync ([cb, who, json] { cb (who, json); });
+                return true;
+            }
+
+            case MsgType::songFileBegin:
+            {
+                const auto json    = msg.parseJson();
+                const auto offerId = json.getProperty ("offerId", juce::String()).toString();
+
+                bool accepted = false;
+                {
+                    const juce::ScopedLock sl (metaLock);
+                    const auto it = songOffers.find (offerId);
+                    accepted = it != songOffers.end() && it->second.accepted;
+                }
+                if (! accepted)
+                    return true;   // never accepted - ignore the files
+
+                if (offerId != upOfferId)
+                {
+                    // First file of this upload: start a fresh ".part" folder.
+                    if (upTempFolder != juce::File())
+                        upTempFolder.deleteRecursively();
+                    upOfferId    = offerId;
+                    upTempFolder = paths::incomingRoot().getChildFile (juce::File::createLegalFileName (offerId) + ".part");
+                    upTempFolder.deleteRecursively();
+                    upTempFolder.createDirectory();
+                }
+
+                upStream.reset();
+                const auto fileName = json.getProperty ("fileName", juce::String()).toString();
+                const auto dest = upTempFolder.getChildFile (juce::File::createLegalFileName (fileName));
+                dest.deleteFile();
+                upStream = std::make_unique<juce::FileOutputStream> (dest);
+                if (! upStream->openedOk())
+                    upStream.reset();
+                return true;
+            }
+
+            case MsgType::songChunk:
+            {
+                if (upStream != nullptr && msg.body.getSize() > 0)
+                    upStream->write (msg.body.getData(), msg.body.getSize());
+                return true;
+            }
+
+            case MsgType::songFileEnd:
+            {
+                if (upStream != nullptr)
+                {
+                    upStream->flush();
+                    upStream.reset();
+                }
+                return true;
+            }
+
+            case MsgType::songEnd:
+            {
+                const auto json    = msg.parseJson();
+                const auto offerId = json.getProperty ("offerId", juce::String()).toString();
+                const bool ok      = (bool) json.getProperty ("ok", false);
+                const auto error   = json.getProperty ("error", juce::String()).toString();
+                upStream.reset();
+
+                juce::String songName;
+                {
+                    const juce::ScopedLock sl (metaLock);
+                    if (const auto it = songOffers.find (offerId); it != songOffers.end())
+                    {
+                        songName = it->second.name;
+                        songOffers.erase (it);
+                    }
+                }
+                if (offerId != upOfferId || songName.isEmpty())
+                    return true;
+
+                const auto folder = upTempFolder;
+                upOfferId.clear();
+                upTempFolder = juce::File();
+
+                if (! ok)
+                    folder.deleteRecursively();
+
+                const auto who = getName();
+                if (auto cb = server.onSongReceived)
+                    juce::MessageManager::callAsync ([cb, who, songName, folder, ok, error]
+                                                     { cb (who, songName, ok ? folder : juce::File(), ok, error); });
+                return true;
+            }
+
             default:
                 return true; // ignore unknown/unexpected types
         }
@@ -468,6 +601,14 @@ private:
     std::vector<std::pair<juce::String, juce::File>> recSendQueue;    ///< metaLock
     std::unique_ptr<RecordingSender> recSender;
 
+    // -- incoming song upload -------------------------------------------------
+    struct SongOffer { juce::String name; bool accepted = false; };
+    std::map<juce::String, SongOffer> songOffers;                     ///< metaLock
+
+    juce::String upOfferId;                                           ///< reader thread only
+    juce::File   upTempFolder;
+    std::unique_ptr<juce::FileOutputStream> upStream;
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (Connection)
 };
 
@@ -650,6 +791,15 @@ int JamServer::offerRecordingToAutoReceivers (const juce::File& folder)
             if (c->offerRecording (folder))
                 ++sent;
     return sent;
+}
+
+bool JamServer::answerSongOffer (const juce::String& clientName, const juce::String& offerId, bool accept)
+{
+    const juce::ScopedLock sl (connectionLock);
+    for (auto* c : connections)
+        if (c->isHandshaked() && ! c->isFinished() && c->getName().equalsIgnoreCase (clientName))
+            return c->answerSongOffer (offerId, accept);
+    return false;
 }
 
 void JamServer::disconnectClient (const juce::String& clientName)

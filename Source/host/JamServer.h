@@ -64,6 +64,11 @@ public:
         preference is on. Returns the number of offers sent. */
     int offerRecordingToAutoReceivers (const juce::File& folder);
 
+    // -- song upload (musician -> host) --------------------------------------------
+    /** Answers a musician's song offer (offerId from onSongOffer). On accept
+        the musician streams the files; onSongReceived fires when complete. */
+    bool answerSongOffer (const juce::String& clientName, const juce::String& offerId, bool accept);
+
     // -- wiring (set before start) -------------------------------------------
     std::function<juce::var()> getSongListJson;                                        ///< any thread
     std::function<juce::File (const juce::String& songId,
@@ -77,6 +82,14 @@ public:
                         const juce::String& error)> onPrepareStatus;
 
     std::function<void (const juce::String& name, const juce::String& text)> onChat;
+
+    /** A musician wants to send a song: JSON { offerId, name, numFiles, totalBytes }. */
+    std::function<void (const juce::String& clientName, juce::var offer)> onSongOffer;
+
+    /** An accepted song upload finished. On ok the received audio files sit in
+        @p folder (a temp folder - import them, then delete it). */
+    std::function<void (const juce::String& clientName, const juce::String& songName,
+                        juce::File folder, bool ok, const juce::String& error)> onSongReceived;
 
     // -- events (reader thread, live path) --------------------------------------
     std::function<void (const juce::String& clientName, juce::int64 startSample,

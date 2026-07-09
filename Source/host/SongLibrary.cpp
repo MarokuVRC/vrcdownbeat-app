@@ -3,8 +3,10 @@
 
 namespace bandjam
 {
-SongLibrary::SongLibrary()
+SongLibrary::SongLibrary (const juce::File& rootFolder)
+    : root (rootFolder == juce::File() ? paths::libraryRoot() : rootFolder)
 {
+    root.createDirectory();
     formatManager.registerBasicFormats();
     load();
 }
@@ -21,7 +23,7 @@ void SongLibrary::load()
 {
     songs.clear();
 
-    for (const auto& entry : juce::RangedDirectoryIterator (paths::libraryRoot(), false, "*", juce::File::findDirectories))
+    for (const auto& entry : juce::RangedDirectoryIterator (root, false, "*", juce::File::findDirectories))
     {
         const auto manifest = entry.getFile().getChildFile ("song.json");
         if (! manifest.existsAsFile())
@@ -97,7 +99,7 @@ juce::String SongLibrary::addSong (const juce::String& name,
     LibrarySong song;
     song.id     = juce::Uuid().toString();
     song.name   = name.trim().isEmpty() ? stemFiles[0].getFileNameWithoutExtension() : name.trim();
-    song.folder = paths::libraryRoot().getChildFile (paths::safeFileName (song.name) + "_" + song.id.substring (0, 8));
+    song.folder = root.getChildFile (paths::safeFileName (song.name) + "_" + song.id.substring (0, 8));
 
     if (! song.folder.createDirectory())
     {

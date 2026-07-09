@@ -16,6 +16,8 @@ inline juce::File appDataRoot()
 inline juce::File libraryRoot()    { auto d = appDataRoot().getChildFile ("library");    d.createDirectory(); return d; }
 inline juce::File downloadsRoot()  { auto d = appDataRoot().getChildFile ("downloads");  d.createDirectory(); return d; }
 inline juce::File recordingsRoot() { auto d = appDataRoot().getChildFile ("recordings"); d.createDirectory(); return d; }
+inline juce::File localSongsRoot() { auto d = appDataRoot().getChildFile ("mysongs");    d.createDirectory(); return d; }
+inline juce::File incomingRoot()   { auto d = appDataRoot().getChildFile ("incoming");   d.createDirectory(); return d; }
 inline juce::File settingsFile()  { return appDataRoot().getChildFile ("settings.json"); }
 
 /** Keeps only characters that are safe in file names. */

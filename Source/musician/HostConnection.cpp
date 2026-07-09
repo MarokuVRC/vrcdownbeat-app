@@ -4,6 +4,18 @@
 
 namespace bandjam
 {
+/** Streams the offered song files to the host once it accepted, so the
+    reader loop and the UI stay responsive during the upload. */
+class HostConnection::SongUploader : public juce::Thread
+{
+public:
+    explicit SongUploader (HostConnection& c) : juce::Thread ("bandjam-song-upload"), conn (c) {}
+    void run() override { conn.runSongUpload (*this); }
+
+private:
+    HostConnection& conn;
+};
+
 HostConnection::HostConnection() : juce::Thread ("bandjam-hostconnection") {}
 
 HostConnection::~HostConnection()
@@ -41,6 +53,16 @@ void HostConnection::disconnect()
     socket.close();
     stopThread (4000);
     connected.store (false);
+
+    if (songUploader != nullptr)
+        songUploader->stopThread (4000);
+    {
+        const juce::ScopedLock sl (uploadLock);
+        upOfferId.clear();
+        upSongName.clear();
+        upFiles.clear();
+        upTotalBytes = 0;
+    }
 }
 
 void HostConnection::run()
@@ -133,6 +155,16 @@ void HostConnection::run()
     recTempFolder = juce::File();
     recRecId.clear();
     recOfferedTotals.clear();
+
+    // Drop a pending song offer - the uploader (if running) notices the
+    // closed connection on its next send and exits.
+    {
+        const juce::ScopedLock sl (uploadLock);
+        upOfferId.clear();
+        upSongName.clear();
+        upFiles.clear();
+        upTotalBytes = 0;
+    }
 
     if (wasConnected)
         onMessageThread ([cb = onDisconnected]
@@ -281,6 +313,39 @@ void HostConnection::handleMessage (const Message& msg)
             int numSamples = 0;
             if (wire::decodeVoiceBlock (msg, speaker, startSample, samples, numSamples) && onVoiceBlock)
                 onVoiceBlock (speaker, samples, numSamples);   // reader thread, by design
+            break;
+        }
+
+        case MsgType::songAnswer:
+        {
+            const auto json    = msg.parseJson();
+            const auto offerId = json.getProperty ("offerId", juce::String()).toString();
+            const bool accept  = (bool) json.getProperty ("accept", false);
+
+            bool matches = false;
+            {
+                const juce::ScopedLock sl (uploadLock);
+                matches = offerId.isNotEmpty() && offerId == upOfferId;
+                if (matches && ! accept)
+                {
+                    upOfferId.clear();
+                    upSongName.clear();
+                    upFiles.clear();
+                    upTotalBytes = 0;
+                }
+            }
+            if (! matches)
+                break;
+
+            onMessageThread ([cb = onSongOfferAnswer, accept] { if (cb) cb (accept); });
+
+            if (accept)
+            {
+                if (songUploader == nullptr)
+                    songUploader = std::make_unique<SongUploader> (*this);
+                if (! songUploader->isThreadRunning())
+                    songUploader->startThread();
+            }
             break;
         }
 
@@ -473,6 +538,157 @@ bool HostConnection::sendRecordingAnswer (const juce::String& recId, bool accept
     obj->setProperty ("recId", recId);
     obj->setProperty ("accept", accept);
     return sendJson (MsgType::recordingAnswer, juce::var (obj));
+}
+
+bool HostConnection::sendRawBytes (MsgType type, const void* data, juce::uint32 bytes)
+{
+    if (! connected.load())
+        return false;
+
+    const juce::ScopedLock sl (writeLock);
+    return wire::send (socket, type, data, bytes, &cryptoSession);
+}
+
+bool HostConnection::offerSong (const juce::String& name, const juce::Array<juce::File>& files)
+{
+    if (! connected.load() || name.trim().isEmpty() || files.isEmpty())
+        return false;
+    if (songUploader != nullptr && songUploader->isThreadRunning())
+        return false;   // an upload is still finishing
+
+    juce::int64 totalBytes = 0;
+    for (const auto& f : files)
+    {
+        if (! f.existsAsFile())
+            return false;
+        totalBytes += f.getSize();
+    }
+
+    const auto offerId = juce::Uuid().toString();
+    {
+        const juce::ScopedLock sl (uploadLock);
+        if (upOfferId.isNotEmpty())
+            return false;   // one offer at a time
+        upOfferId    = offerId;
+        upSongName   = name.trim();
+        upFiles      = files;
+        upTotalBytes = totalBytes;
+    }
+
+    auto* obj = new juce::DynamicObject();
+    obj->setProperty ("offerId", offerId);
+    obj->setProperty ("name", name.trim());
+    obj->setProperty ("numFiles", files.size());
+    obj->setProperty ("totalBytes", totalBytes);
+
+    if (! sendJson (MsgType::songOffer, juce::var (obj)))
+    {
+        const juce::ScopedLock sl (uploadLock);
+        upOfferId.clear();
+        upSongName.clear();
+        upFiles.clear();
+        upTotalBytes = 0;
+        return false;
+    }
+    return true;
+}
+
+void HostConnection::runSongUpload (juce::Thread& runner)
+{
+    juce::String offerId;
+    juce::Array<juce::File> files;
+    juce::int64 totalBytes = 0;
+    {
+        const juce::ScopedLock sl (uploadLock);
+        offerId    = upOfferId;
+        files      = upFiles;
+        totalBytes = upTotalBytes;
+    }
+    if (offerId.isEmpty() || files.isEmpty())
+        return;
+
+    auto clearJob = [this]
+    {
+        const juce::ScopedLock sl (uploadLock);
+        upOfferId.clear();
+        upSongName.clear();
+        upFiles.clear();
+        upTotalBytes = 0;
+    };
+    auto finish = [&] (bool ok, const juce::String& error)
+    {
+        auto* obj = new juce::DynamicObject();
+        obj->setProperty ("offerId", offerId);
+        obj->setProperty ("ok", ok);
+        if (error.isNotEmpty()) obj->setProperty ("error", error);
+        sendJson (MsgType::songEnd, juce::var (obj));
+
+        clearJob();
+        onMessageThread ([cb = onSongUploadEnd, ok, error] { if (cb) cb (ok, error); });
+    };
+
+    constexpr int kChunkBytes = 256 * 1024;
+    juce::HeapBlock<char> chunk (kChunkBytes);
+    juce::int64  sentBytes = 0;
+    juce::uint32 lastProgressMs = 0;
+
+    for (int index = 0; index < files.size(); ++index)
+    {
+        if (runner.threadShouldExit() || ! connected.load())
+        {
+            clearJob();
+            onMessageThread ([cb = onSongUploadEnd] { if (cb) cb (false, "Connection lost."); });
+            return;
+        }
+
+        const auto& file = files.getReference (index);
+        juce::FileInputStream in (file);
+        if (! in.openedOk())
+        {
+            finish (false, "Could not open " + file.getFileName());
+            return;
+        }
+
+        {
+            auto* obj = new juce::DynamicObject();
+            obj->setProperty ("offerId", offerId);
+            obj->setProperty ("fileName", file.getFileName());
+            obj->setProperty ("fileSize", in.getTotalLength());
+            obj->setProperty ("fileIndex", index);
+            obj->setProperty ("numFiles", files.size());
+            if (! sendJson (MsgType::songFileBegin, juce::var (obj)))
+                { clearJob(); onMessageThread ([cb = onSongUploadEnd] { if (cb) cb (false, "Send failed."); }); return; }
+        }
+
+        while (! in.isExhausted() && ! runner.threadShouldExit())
+        {
+            const int got = in.read (chunk.getData(), kChunkBytes);
+            if (got <= 0)
+                break;
+            if (! sendRawBytes (MsgType::songChunk, chunk.getData(), (juce::uint32) got))
+                { clearJob(); onMessageThread ([cb = onSongUploadEnd] { if (cb) cb (false, "Send failed."); }); return; }
+
+            sentBytes += got;
+            const auto now = juce::Time::getMillisecondCounter();
+            if (now - lastProgressMs >= 200)
+            {
+                lastProgressMs = now;
+                onMessageThread ([cb = onSongUploadProgress, sentBytes, totalBytes]
+                                 { if (cb) cb (sentBytes, totalBytes); });
+            }
+        }
+
+        {
+            auto* obj = new juce::DynamicObject();
+            obj->setProperty ("offerId", offerId);
+            obj->setProperty ("fileName", file.getFileName());
+            obj->setProperty ("ok", true);
+            if (! sendJson (MsgType::songFileEnd, juce::var (obj)))
+                { clearJob(); onMessageThread ([cb = onSongUploadEnd] { if (cb) cb (false, "Send failed."); }); return; }
+        }
+    }
+
+    finish (true, {});
 }
 
 bool HostConnection::requestStem (const juce::String& songId, const juce::String& stemId,
