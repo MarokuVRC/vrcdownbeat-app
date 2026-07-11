@@ -519,7 +519,7 @@ void AudioStreamPanel::applyStreamState()
     settings::set (options.outDeviceSettingsKey, device);
 
     micTalkInfoLabel.setText ("Talk mic: " + (talk.isNotEmpty() ? talk : juce::String ("(none)"))
-                              + "  -  change it in the Audio tab",
+                              + "  -  change it in Settings > Audio",
                               juce::dontSendNotification);
 
     if (device.isEmpty())
@@ -586,7 +586,7 @@ void AudioStreamPanel::setTalkListen (bool enabled)
     const auto captureId = findTalkCaptureId();
     if (captureId.isEmpty())
     {
-        setStatus ("Select a talk mic in the Audio tab first.", style::textDim());
+        setStatus ("Select a talk mic in Settings > Audio first.", style::textDim());
         return;
     }
 

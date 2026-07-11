@@ -9,3 +9,6 @@ build-release/
 /*.png
 shots/
 tools/*.png
+
+# Release zips built locally
+/*.zip

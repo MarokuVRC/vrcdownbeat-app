@@ -13,6 +13,7 @@
 #include "ui/AudioStreamPanel.h"
 #include "ui/ChatPanel.h"
 #include "ui/RecordingsPanel.h"
+#include "ui/ChildWindow.h"
 
 namespace bandjam
 {
@@ -22,6 +23,7 @@ namespace bandjam
     the audio settings (device/ASIO, latency info, manual offset). */
 class MusicianView : public juce::Component,
                      public juce::ListBoxModel,   // songs list
+                     public juce::MenuBarModel,   // "Connect" / "Settings" menus
                      private juce::Timer
 {
 public:
@@ -39,6 +41,11 @@ public:
     void paintListBoxItem (int row, juce::Graphics&, int width, int height, bool selected) override;
     void selectedRowsChanged (int) override;
 
+    // MenuBarModel
+    juce::StringArray getMenuBarNames() override;
+    juce::PopupMenu getMenuForIndex (int menuIndex, const juce::String& menuName) override;
+    void menuItemSelected (int menuItemID, int menuIndex) override;
+
 private:
     enum class JamPhase { idle, downloading, loading, ready, countdown, running };
 
@@ -46,7 +53,11 @@ private:
 
     void timerCallback() override;
 
-    void toggleConnect();
+    void showConnectDialog();
+    void showRoomConnectDialog();
+    void startConnect (const juce::String& name, const juce::String& host, int port,
+                       const juce::String& roomCode);
+    void updateConnectUi();
     void handleDisconnected (const juce::String& reason);
 
     void downloadClicked();
@@ -115,16 +126,17 @@ private:
     juce::var    lastSongListJson;
 
     // -- widgets -----------------------------------------------------------------
+    // Top bar: Connect/Settings menus (Windows style) + Change Role/Disconnect,
+    // which stay reachable no matter which tool windows are open.
+    juce::MenuBarComponent menuBar { this };
     juce::Label      headerLabel;
-    juce::TextButton leaveButton;
+    juce::TextButton leaveButton;        ///< "Change Role" - back to the mode picker
+    juce::TextButton disconnectButton;   ///< visible while connected
 
-    juce::Label      nameCaption, hostCaption, portCaption, roomCaption, connStatusLabel;
-    juce::TextEditor nameEditor, hostEditor, portEditor, roomEditor;
-    juce::TextButton connectButton;
+    juce::Label      connStatusLabel;
 
-    // Tabs: "Session" (jam workflow + chat), "Audio" (device/VST3/MIDI
-    // settings), "Audio Stream" (routing board) and "Recordings".
-    juce::TabbedComponent tabs { juce::TabbedButtonBar::TabsAtTop };
+    // Main content is the session (jam workflow + chat). "Audio",
+    // "Audio Stream" and "Recordings" open as separate tool windows.
     LambdaPage sessionPage, audioPage, streamPage, recordingsPage;
     std::unique_ptr<AudioStreamPanel> streamPanel;
     std::unique_ptr<RecordingsPanel> recordingsPanel;
@@ -174,9 +186,13 @@ private:
 
     juce::Label      instCaption, instStatusLabel, midiCaption, midiActivityLabel;
     juce::TextButton instLoadButton, instUiButton, instRemoveButton, midiRescanButton;
+    juce::ToggleButton loadVstOnStartToggle;
     juce::ComboBox   midiInputBox;
     juce::Array<juce::MidiDeviceInfo> midiInputs;
     std::unique_ptr<juce::FileChooser> instChooser;
+
+    // Tool windows (declared last so they are destroyed before their content).
+    std::unique_ptr<ChildWindow> audioWindow, streamWindow, recordingsWindow;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MusicianView)
 };

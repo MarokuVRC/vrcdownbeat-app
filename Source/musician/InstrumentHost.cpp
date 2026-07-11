@@ -31,7 +31,8 @@ public:
 };
 
 //==============================================================================
-InstrumentHost::InstrumentHost()
+InstrumentHost::InstrumentHost (const juce::String& settingsPrefix)
+    : keyPrefix (settingsPrefix)
 {
     formatManager.addFormat (new juce::VST3PluginFormat());
 }
@@ -84,18 +85,18 @@ bool InstrumentHost::loadPlugin (const juce::File& vst3File, double sampleRate, 
     pluginFile = vst3File;
 
     // Restore the saved state if it belongs to this same plugin file.
-    if (settings::get ("instrumentPlugin", "").toString() == vst3File.getFullPathName())
+    if (settings::get (key ("instrumentPlugin"), "").toString() == vst3File.getFullPathName())
     {
         juce::MemoryBlock state;
-        if (state.fromBase64Encoding (settings::get ("instrumentState", "").toString())
+        if (state.fromBase64Encoding (settings::get (key ("instrumentState"), "").toString())
             && state.getSize() > 0)
             plugin->setStateInformation (state.getData(), (int) state.getSize());
     }
 
     prepare (rate, block);
-    setMidiInput (settings::get ("midiInput", "").toString());
+    setMidiInput (settings::get (key ("midiInput"), "").toString());
 
-    settings::set ("instrumentPlugin", vst3File.getFullPathName());
+    settings::set (key ("instrumentPlugin"), vst3File.getFullPathName());
     active.store (true);
     return true;
 }
@@ -131,13 +132,13 @@ void InstrumentHost::saveState() const
 
     juce::MemoryBlock state;
     plugin->getStateInformation (state);
-    settings::set ("instrumentPlugin", pluginFile.getFullPathName());
-    settings::set ("instrumentState", state.toBase64Encoding());
+    settings::set (key ("instrumentPlugin"), pluginFile.getFullPathName());
+    settings::set (key ("instrumentState"), state.toBase64Encoding());
 }
 
 juce::File InstrumentHost::getSavedPluginFile() const
 {
-    const auto path = settings::get ("instrumentPlugin", "").toString();
+    const auto path = settings::get (key ("instrumentPlugin"), "").toString();
     return path.isNotEmpty() ? juce::File (path) : juce::File();
 }
 
@@ -178,7 +179,7 @@ void InstrumentHost::setMidiInput (const juce::String& identifier)
     }
 
     midiIdentifier = identifier;
-    settings::set ("midiInput", identifier);
+    settings::set (key ("midiInput"), identifier);
     midiFailed.store (false);
 
     if (identifier.isEmpty())

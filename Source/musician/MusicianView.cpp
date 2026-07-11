@@ -43,12 +43,14 @@ private:
 
 MusicianView::MusicianView()
 {
-    // -- header ------------------------------------------------------------------
+    // -- top bar: menus + Change Role / Disconnect ---------------------------------
+    addAndMakeVisible (menuBar);
+
     headerLabel.setText ("Musician", juce::dontSendNotification);
     headerLabel.setFont (style::titleFont());
     addAndMakeVisible (headerLabel);
 
-    leaveButton.setButtonText ("Leave");
+    leaveButton.setButtonText ("Change Role");
     leaveButton.onClick = [this]
     {
         voice.stop();
@@ -59,42 +61,17 @@ MusicianView::MusicianView()
     };
     addAndMakeVisible (leaveButton);
 
-    // -- connect bar ----------------------------------------------------------------
-    auto initCaption = [this] (juce::Label& label, const juce::String& text)
+    disconnectButton.setButtonText ("Disconnect");
+    disconnectButton.setColour (juce::TextButton::buttonColourId, style::bad().withAlpha (0.55f));
+    disconnectButton.onClick = [this]
     {
-        label.setText (text, juce::dontSendNotification);
-        label.setColour (juce::Label::textColourId, style::textDim());
-        addAndMakeVisible (label);
+        connection.disconnect();
+        handleDisconnected ("Disconnected.");
     };
+    addChildComponent (disconnectButton);   // only visible while connected
 
-    initCaption (nameCaption, "Name:");
-    initCaption (hostCaption, "Host:");
-    initCaption (portCaption, "Port:");
-    initCaption (roomCaption, "Room:");
-
-    nameEditor.setText (settings::get ("musicianName", "").toString());
-    addAndMakeVisible (nameEditor);
-
-    hostEditor.setText (settings::get ("lastHost", "127.0.0.1").toString());
-    addAndMakeVisible (hostEditor);
-
-    portEditor.setText (settings::get ("lastPort", kDefaultPort).toString());
-    portEditor.setInputRestrictions (5, "0123456789");
-    addAndMakeVisible (portEditor);
-
-    // Room code (relay). When filled in, it wins over Host/Port - no port
-    // forwarding or IP sharing needed on either side.
-    roomEditor.setText (settings::get ("lastRoom", "").toString());
-    roomEditor.setInputRestrictions (6, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789");
-    roomEditor.setJustification (juce::Justification::centred);
-    roomEditor.setTextToShowWhenEmpty ("code", style::textDim());
-    addAndMakeVisible (roomEditor);
-
-    connectButton.setButtonText ("Connect");
-    connectButton.onClick = [this] { toggleConnect(); };
-    addAndMakeVisible (connectButton);
-
-    connStatusLabel.setText ("Not connected", juce::dontSendNotification);
+    // -- status strip ----------------------------------------------------------------
+    connStatusLabel.setText ("Not connected - use the Connect menu to join a host", juce::dontSendNotification);
     connStatusLabel.setColour (juce::Label::textColourId, style::textDim());
     addAndMakeVisible (connStatusLabel);
 
@@ -241,7 +218,7 @@ MusicianView::MusicianView()
         if (talk && talkAutoMuted)
         {
             chatPanel.setTalkActive (false);
-            chatPanel.addSystemMessage ("Talk mic is auto-muted right now - turn the toggle off in the Audio tab to talk");
+            chatPanel.addSystemMessage ("Talk mic is auto-muted right now - turn the toggle off in the Audio settings to talk");
             return;
         }
         if (talk && ! voice.isRunning())
@@ -250,7 +227,7 @@ MusicianView::MusicianView()
         if (talk && voice.getTalkMicName().isEmpty())
         {
             chatPanel.setTalkActive (false);
-            chatPanel.addSystemMessage ("Select a talk mic in the Audio tab first");
+            chatPanel.addSystemMessage ("Select a talk mic in Settings > Audio first");
         }
     };
 
@@ -364,6 +341,15 @@ MusicianView::MusicianView()
     };
     audioPage.addAndMakeVisible (instRemoveButton);
 
+    loadVstOnStartToggle.setButtonText ("Load VST on startup");
+    loadVstOnStartToggle.setToggleState ((bool) settings::get ("loadVstOnStartup", false),
+                                         juce::dontSendNotification);
+    loadVstOnStartToggle.onClick = [this]
+    {
+        settings::set ("loadVstOnStartup", loadVstOnStartToggle.getToggleState());
+    };
+    audioPage.addAndMakeVisible (loadVstOnStartToggle);
+
     initAudioCaption (midiCaption, "MIDI in:");
     midiInputBox.onChange = [this]
     {
@@ -434,11 +420,11 @@ MusicianView::MusicianView()
         {
             AudioStreamPanel::BuiltinSource source;
             source.name          = "BandJam - talk mic";
-            source.subtitle      = "set the device in the Audio tab";
+            source.subtitle      = "set the device in Settings > Audio";
             source.makeSubtitle  = []
             {
                 auto device = settings::get ("streamTalkDevice", "").toString();
-                return device.isNotEmpty() ? device : juce::String ("no talk mic - set one in the Audio tab");
+                return device.isNotEmpty() ? device : juce::String ("no talk mic - set one in Settings > Audio");
             };
             source.getLevel      = [this] { return engine.getStreamOutput().getTalkLevel(); };
             source.getToMic      = [this] { return engine.getStreamOutput().isTalkEnabled(); };
@@ -522,21 +508,23 @@ MusicianView::MusicianView()
     streamPage.onLayout     = [this] { layoutStreamPage(); };
     recordingsPage.onLayout = [this] { recordingsPanel->setBounds (recordingsPage.getLocalBounds()); };
 
-    tabs.setTabBarDepth (32);
-    tabs.setOutline (0);
-    tabs.addTab ("Session",      juce::Colours::transparentBlack, &sessionPage, false);
-    tabs.addTab ("Audio",        juce::Colours::transparentBlack, &audioPage, false);
-    tabs.addTab ("Audio Stream", juce::Colours::transparentBlack, &streamPage, false);
-    tabs.addTab ("Recordings",   juce::Colours::transparentBlack, &recordingsPage, false);
-    addAndMakeVisible (tabs);
+    // The session is the main content; Audio, Audio Stream and Recordings
+    // live in their own tool windows (Settings menu) so they can stay open
+    // next to the main window.
+    addAndMakeVisible (sessionPage);
 
-    // Restore the last used plugin (state included) so e.g. Superior Drummer
-    // is ready to play right after startup.
-    if (const auto saved = engine.getSavedInstrumentFile(); saved.exists())
-    {
-        juce::String error;
-        engine.loadInstrument (saved, error);
-    }
+    audioWindow      = std::make_unique<ChildWindow> ("Audio - VRC Downbeat",        audioPage,      1050, 760);
+    streamWindow     = std::make_unique<ChildWindow> ("Audio Stream - VRC Downbeat", streamPage,     1100, 760);
+    recordingsWindow = std::make_unique<ChildWindow> ("Recordings - VRC Downbeat",   recordingsPage, 1100, 720);
+
+    // Restore the last used plugin (state included) only when the user opted
+    // in ("Load VST on startup") - loading a big instrument takes a while.
+    if ((bool) settings::get ("loadVstOnStartup", false))
+        if (const auto saved = engine.getSavedInstrumentFile(); saved.exists())
+        {
+            juce::String error;
+            engine.loadInstrument (saved, error);
+        }
     refreshInstrumentUi();
 
     // -- wiring ---------------------------------------------------------------------
@@ -547,15 +535,11 @@ MusicianView::MusicianView()
         if (safe == nullptr) return;
         safe->connStatusLabel.setText ("Connected to " + hostName, juce::dontSendNotification);
         safe->connStatusLabel.setColour (juce::Label::textColourId, style::good());
-        safe->connectButton.setButtonText ("Disconnect");
-        settings::set ("musicianName", safe->nameEditor.getText().trim());
-        settings::set ("lastHost", safe->hostEditor.getText().trim());
-        settings::set ("lastPort", safe->portEditor.getText().getIntValue());
-        settings::set ("lastRoom", safe->roomEditor.getText().trim().toUpperCase());
+        safe->updateConnectUi();
 
         safe->chatPanel.addSystemMessage ("Connected to " + hostName);
         safe->chatPanel.setTalkAvailable (true);
-        safe->chatPanel.setStatusText ("Talk uses the talk mic from the Audio tab.");
+        safe->chatPanel.setStatusText ("Talk uses the talk mic from the Audio settings.");
         safe->startVoice();   // listen to the band even before talking
 
         // Tell the host whether we want jam recordings sent automatically.
@@ -756,40 +740,33 @@ void MusicianView::paint (juce::Graphics& g)
 {
     g.fillAll (style::background());
 
-    auto area = getLocalBounds().reduced (16);
-    area.removeFromTop (44);
-    style::drawPanel (g, area.removeFromTop (56).toFloat());
+    auto area = getLocalBounds().reduced (16, 10);
+    area.removeFromTop (30 + 6);   // menu row
+    style::drawPanel (g, area.removeFromTop (40).toFloat());
 }
 
 void MusicianView::resized()
 {
-    auto area = getLocalBounds().reduced (16);
+    auto area = getLocalBounds().reduced (16, 10);
 
-    auto header = area.removeFromTop (36);
-    leaveButton.setBounds (header.removeFromRight (110).reduced (0, 4));
-    headerLabel.setBounds (header);
+    // Menu row: menus on the left, Change Role/Disconnect pinned top-right so
+    // they stay reachable no matter what is going on.
+    auto menuRow = area.removeFromTop (30);
+    leaveButton.setBounds (menuRow.removeFromRight (110).reduced (0, 2));
+    menuRow.removeFromRight (8);
+    disconnectButton.setBounds (menuRow.removeFromRight (110).reduced (0, 2));
+    menuRow.removeFromRight (12);
+    menuBar.setBounds (menuRow.removeFromLeft (juce::jmin (260, menuRow.getWidth())));
+    area.removeFromTop (6);
+
+    // Status strip: role + connection status.
+    auto status = area.removeFromTop (40).reduced (12, 4);
+    headerLabel.setBounds (status.removeFromLeft (130));
+    status.removeFromLeft (8);
+    connStatusLabel.setBounds (status);
     area.removeFromTop (8);
 
-    // Connect bar
-    auto row = area.removeFromTop (56).reduced (12, 12);
-    nameCaption.setBounds (row.removeFromLeft (48));
-    nameEditor.setBounds (row.removeFromLeft (118).reduced (0, 2));
-    row.removeFromLeft (8);
-    hostCaption.setBounds (row.removeFromLeft (42));
-    hostEditor.setBounds (row.removeFromLeft (126).reduced (0, 2));
-    row.removeFromLeft (8);
-    portCaption.setBounds (row.removeFromLeft (38));
-    portEditor.setBounds (row.removeFromLeft (62).reduced (0, 2));
-    row.removeFromLeft (8);
-    roomCaption.setBounds (row.removeFromLeft (44));
-    roomEditor.setBounds (row.removeFromLeft (74).reduced (0, 2));
-    row.removeFromLeft (10);
-    connectButton.setBounds (row.removeFromLeft (110).reduced (0, 1));
-    row.removeFromLeft (10);
-    connStatusLabel.setBounds (row);
-    area.removeFromTop (8);
-
-    tabs.setBounds (area);
+    sessionPage.setBounds (area);
 }
 
 void MusicianView::layoutSessionPage()
@@ -920,6 +897,8 @@ void MusicianView::layoutAudioPage()
     instUiButton.setBounds (instButtons.removeFromLeft (buttonWidth));
     instButtons.removeFromLeft (6);
     instRemoveButton.setBounds (instButtons);
+    inst.removeFromTop (6);
+    loadVstOnStartToggle.setBounds (inst.removeFromTop (24));
     inst.removeFromTop (6);
     auto midiRow = inst.removeFromTop (26);
     midiCaption.setBounds (midiRow.removeFromLeft (64));
@@ -1057,16 +1036,110 @@ std::vector<songloader::StemRequest> MusicianView::requestsFor (const LocalSong&
 }
 
 //==============================================================================
-void MusicianView::toggleConnect()
+// Connect / Settings menus
+juce::StringArray MusicianView::getMenuBarNames()
+{
+    return { "Connect", "Settings" };
+}
+
+juce::PopupMenu MusicianView::getMenuForIndex (int menuIndex, const juce::String&)
+{
+    juce::PopupMenu menu;
+
+    if (menuIndex == 0)   // Connect
+    {
+        const bool idle = ! connection.isConnected();
+        menu.addItem (1, "Connect to Host...", idle);
+        menu.addItem (2, "Connect via Downbeat Server...", idle);
+    }
+    else if (menuIndex == 1)   // Settings
+    {
+        menu.addItem (11, "Audio");
+        menu.addItem (12, "Audio Stream");
+        menu.addItem (13, "Recordings");
+    }
+    return menu;
+}
+
+void MusicianView::menuItemSelected (int menuItemID, int)
+{
+    switch (menuItemID)
+    {
+        case 1:  showConnectDialog();         break;
+        case 2:  showRoomConnectDialog();     break;
+        case 11: audioWindow->open();         break;
+        case 12: streamWindow->open();        break;
+        case 13: recordingsWindow->open();    break;
+        default: break;
+    }
+}
+
+void MusicianView::showConnectDialog()
 {
     if (connection.isConnected())
-    {
-        connection.disconnect();
-        handleDisconnected ("Disconnected.");
         return;
-    }
 
-    const auto name = nameEditor.getText().trim();
+    auto* window = new juce::AlertWindow ("Connect to Host",
+                                          "Connect directly to a host's IP address and port.",
+                                          juce::MessageBoxIconType::NoIcon);
+    window->addTextEditor ("name", settings::get ("musicianName", "").toString(), "Your name:");
+    window->addTextEditor ("host", settings::get ("lastHost", "127.0.0.1").toString(), "Host IP / address:");
+    window->addTextEditor ("port", settings::get ("lastPort", kDefaultPort).toString(), "TCP port:");
+    window->getTextEditor ("name")->setInputRestrictions (24);
+    window->getTextEditor ("port")->setInputRestrictions (5, "0123456789");
+    window->addButton ("Connect", 1, juce::KeyPress (juce::KeyPress::returnKey));
+    window->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+
+    juce::Component::SafePointer<MusicianView> safe (this);
+    window->enterModalState (true,
+        juce::ModalCallbackFunction::create ([safe, window] (int result)
+        {
+            if (safe == nullptr || result != 1)
+                return;
+
+            safe->startConnect (window->getTextEditorContents ("name").trim(),
+                                window->getTextEditorContents ("host").trim(),
+                                juce::jlimit (1, 65535, window->getTextEditorContents ("port").getIntValue()),
+                                {});
+        }),
+        true);
+}
+
+void MusicianView::showRoomConnectDialog()
+{
+    if (connection.isConnected())
+        return;
+
+    auto* window = new juce::AlertWindow ("Connect via Downbeat Server",
+                                          "Join with the room code you got from your host - "
+                                          "no IP addresses or port forwarding needed.",
+                                          juce::MessageBoxIconType::NoIcon);
+    window->addTextEditor ("name", settings::get ("musicianName", "").toString(), "Your name:");
+    window->addTextEditor ("room", settings::get ("lastRoom", "").toString(), "Room code:");
+    window->getTextEditor ("name")->setInputRestrictions (24);
+    window->getTextEditor ("room")->setInputRestrictions (6, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789");
+    window->addButton ("Connect", 1, juce::KeyPress (juce::KeyPress::returnKey));
+    window->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+
+    juce::Component::SafePointer<MusicianView> safe (this);
+    window->enterModalState (true,
+        juce::ModalCallbackFunction::create ([safe, window] (int result)
+        {
+            if (safe == nullptr || result != 1)
+                return;
+
+            safe->startConnect (window->getTextEditorContents ("name").trim(), {}, 0,
+                                window->getTextEditorContents ("room").trim().toUpperCase());
+        }),
+        true);
+}
+
+void MusicianView::startConnect (const juce::String& name, const juce::String& host, int port,
+                                 const juce::String& roomCode)
+{
+    if (connection.isConnected())
+        return;
+
     if (name.isEmpty())
     {
         connStatusLabel.setText ("Please enter a name first.", juce::dontSendNotification);
@@ -1074,26 +1147,33 @@ void MusicianView::toggleConnect()
         return;
     }
 
-    const auto room = roomEditor.getText().trim().toUpperCase();
+    settings::set ("musicianName", name);
 
-    connStatusLabel.setText (room.isNotEmpty() ? "Connecting via room code..." : "Connecting...",
+    connStatusLabel.setText (roomCode.isNotEmpty() ? "Connecting via room code..." : "Connecting...",
                              juce::dontSendNotification);
     connStatusLabel.setColour (juce::Label::textColourId, style::textDim());
 
-    if (room.isNotEmpty())
+    if (roomCode.isNotEmpty())
     {
+        settings::set ("lastRoom", roomCode);
+
         juce::String relayHost;
         int relayPort = relay::kDefaultPort;
         relay::parseAddress (settings::get ("relayAddress", juce::String (relay::kDefaultAddress)).toString(),
                              relayHost, relayPort);
-        connection.connectViaRelay (relayHost, relayPort, room, name);
+        connection.connectViaRelay (relayHost, relayPort, roomCode, name);
     }
     else
     {
-        connection.connectTo (hostEditor.getText().trim(),
-                              juce::jlimit (1, 65535, portEditor.getText().getIntValue()),
-                              name);
+        settings::set ("lastHost", host);
+        settings::set ("lastPort", port);
+        connection.connectTo (host, port, name);
     }
+}
+
+void MusicianView::updateConnectUi()
+{
+    disconnectButton.setVisible (connection.isConnected());
 }
 
 void MusicianView::handleDisconnected (const juce::String& reason)
@@ -1113,7 +1193,7 @@ void MusicianView::handleDisconnected (const juce::String& reason)
 
     connStatusLabel.setText (reason, juce::dontSendNotification);
     connStatusLabel.setColour (juce::Label::textColourId, style::warn());
-    connectButton.setButtonText ("Connect");
+    updateConnectUi();
     downloadStatusLabel.setText ({}, juce::dontSendNotification);
     jamStatusLabel.setText ("No jam active.", juce::dontSendNotification);
     updateTransportButtons();

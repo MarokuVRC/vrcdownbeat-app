@@ -78,12 +78,14 @@ private:
 //==============================================================================
 HostView::HostView()
 {
-    // -- header ------------------------------------------------------------------
+    // -- top bar: menus + Change Role / Disconnect ---------------------------------
+    addAndMakeVisible (menuBar);
+
     headerLabel.setText ("Host", juce::dontSendNotification);
     headerLabel.setFont (style::titleFont());
     addAndMakeVisible (headerLabel);
 
-    leaveButton.setButtonText ("Leave");
+    leaveButton.setButtonText ("Change Role");
     leaveButton.onClick = [this]
     {
         stopJam ("Host closed", true);
@@ -93,34 +95,15 @@ HostView::HostView()
     };
     addAndMakeVisible (leaveButton);
 
-    // -- server panel ---------------------------------------------------------------
-    nameCaption.setText ("Name:", juce::dontSendNotification);
-    nameCaption.setColour (juce::Label::textColourId, style::textDim());
-    addAndMakeVisible (nameCaption);
+    disconnectButton.setButtonText ("Disconnect");
+    disconnectButton.setColour (juce::TextButton::buttonColourId, style::bad().withAlpha (0.55f));
+    disconnectButton.onClick = [this] { stopHosting(); };
+    addChildComponent (disconnectButton);   // only visible while hosting
 
-    nameEditor.setText (settings::get ("hostName", "").toString());
-    nameEditor.setInputRestrictions (24);
-    nameEditor.setTextToShowWhenEmpty ("your name", style::textDim());
-    addAndMakeVisible (nameEditor);
-
-    portCaption.setText ("Port:", juce::dontSendNotification);
-    portCaption.setColour (juce::Label::textColourId, style::textDim());
-    addAndMakeVisible (portCaption);
-
-    portEditor.setText (settings::get ("hostPort", kDefaultPort).toString());
-    portEditor.setInputRestrictions (5, "0123456789");
-    portEditor.setJustification (juce::Justification::centred);
-    addAndMakeVisible (portEditor);
-
-    serverButton.setButtonText ("Start own Server");
-    serverButton.onClick = [this] { toggleServer(); };
-    addAndMakeVisible (serverButton);
-
-    roomButton.setButtonText ("Host via Downbeat Server");
-    roomButton.setTooltip ("Opens a room on the relay server. Musicians join with the room code - "
-                           "no port forwarding, no IP sharing on either side.");
-    roomButton.onClick = [this] { toggleRoom(); };
-    addAndMakeVisible (roomButton);
+    // -- status strip ----------------------------------------------------------------
+    serverStatusLabel.setText ("Server is off - use the Connect menu to start hosting", juce::dontSendNotification);
+    serverStatusLabel.setColour (juce::Label::textColourId, style::textDim());
+    addAndMakeVisible (serverStatusLabel);
 
     copyCodeButton.setButtonText ("Copy code");
     copyCodeButton.onClick = [this]
@@ -129,13 +112,20 @@ HostView::HostView()
     };
     addChildComponent (copyCodeButton);   // only visible while a room is open
 
-    serverStatusLabel.setText ("Server is off", juce::dontSendNotification);
-    serverStatusLabel.setColour (juce::Label::textColourId, style::textDim());
-    addAndMakeVisible (serverStatusLabel);
+    // -- "Test Port" window content ---------------------------------------------------
+    portTestHintLabel.setText ("Checks from the internet whether musicians can reach your server "
+                               "directly (only needed for \"Host Server\" - the Downbeat server "
+                               "works without an open port).\n"
+                               "Start your server first, then run the test.",
+                               juce::dontSendNotification);
+    portTestHintLabel.setFont (juce::Font (juce::FontOptions (13.5f)));
+    portTestHintLabel.setColour (juce::Label::textColourId, style::textDim());
+    portTestHintLabel.setJustificationType (juce::Justification::topLeft);
+    portTestPage.addAndMakeVisible (portTestHintLabel);
 
     ipLabel.setColour (juce::Label::textColourId, style::textDim());
     ipLabel.setFont (juce::Font (juce::FontOptions (13.0f)));
-    addAndMakeVisible (ipLabel);
+    portTestPage.addAndMakeVisible (ipLabel);
 
     // IPs stay hidden until deliberately revealed (e.g. while screen-sharing).
     ipsVisible = (bool) settings::get ("showIps", false);
@@ -149,21 +139,28 @@ HostView::HostView()
         showIpsButton.setButtonText (ipsVisible ? "Hide IPs" : "Show IPs");
         refreshIpLabel();
     };
-    addAndMakeVisible (showIpsButton);
+    portTestPage.addAndMakeVisible (showIpsButton);
 
-    portTestButton.setButtonText ("Test port");
+    portTestButton.setButtonText ("Run test");
     portTestButton.setEnabled (false);
     portTestButton.onClick = [this] { testPortClicked(); };
-    addAndMakeVisible (portTestButton);
+    portTestPage.addAndMakeVisible (portTestButton);
 
-    portTestResultLabel.setFont (juce::Font (juce::FontOptions (13.0f)));
+    portTestResultLabel.setFont (juce::Font (juce::FontOptions (14.5f, juce::Font::bold)));
     portTestResultLabel.setColour (juce::Label::textColourId, style::textDim());
-    addAndMakeVisible (portTestResultLabel);
+    portTestPage.addAndMakeVisible (portTestResultLabel);
+
+    portTestExplainLabel.setFont (juce::Font (juce::FontOptions (13.5f)));
+    portTestExplainLabel.setColour (juce::Label::textColourId, style::textDim());
+    portTestExplainLabel.setJustificationType (juce::Justification::topLeft);
+    portTestPage.addAndMakeVisible (portTestExplainLabel);
+
+    portTestPage.onLayout = [this] { layoutPortTestPage(); };
 
     refreshIpLabel();
     fetchPublicIp();
 
-    // -- tabs -------------------------------------------------------------------
+    // -- pages ----------------------------------------------------------------
     // "Session" holds the jam workflow; "VRChat Stream" the virtual-mic and
     // per-app routing tools (kept separate so the main view stays uncluttered).
     sessionPage.onLayout = [this] { layoutSessionPage(); };
@@ -207,7 +204,7 @@ HostView::HostView()
     recordToggle.setButtonText ("Record");
     sessionPage.addAndMakeVisible (recordToggle);
 
-    jamStatusLabel.setText ("Start the server, pick a song, let musicians connect - then \"Prepare Jam\".",
+    jamStatusLabel.setText ("Start a server (Connect menu), pick a song, let musicians connect - then \"Prepare Jam\".",
                             juce::dontSendNotification);
     jamStatusLabel.setColour (juce::Label::textColourId, style::textDim());
     sessionPage.addAndMakeVisible (jamStatusLabel);
@@ -300,6 +297,10 @@ HostView::HostView()
     // -- Audio tab: talk mic (second input, separate from the interface input) -------
     initTalkMicControls();
 
+    // -- Audio settings: VST3 instrument + recording options --------------------------
+    initInstrumentControls();
+    initRecordingControls();
+
     // -- Audio Stream tab: routing board -----------------------------------------------
     {
         // Persisted include flags go straight into the engine before the
@@ -329,6 +330,11 @@ HostView::HostView()
             AudioStreamPanel::BuiltinSource source;
             source.name          = "BandJam - my instrument";
             source.subtitle      = "your instrument/mic on the interface";
+            source.makeSubtitle  = [this]
+            {
+                return engine.hasInstrument() ? "VST3: " + engine.getInstrumentName()
+                                              : juce::String ("your instrument/mic on the interface");
+            };
             source.getLevel      = [this] { return engine.getHostInputLevel(); };
             source.getToMic      = [this] { return engine.getStreamIncludeInput(); };
             source.setToMic      = [this] (bool on) { engine.setStreamIncludeInput (on);
@@ -345,11 +351,11 @@ HostView::HostView()
         {
             AudioStreamPanel::BuiltinSource source;
             source.name          = "BandJam - talk mic";
-            source.subtitle      = "set the device in the Audio tab";
+            source.subtitle      = "set the device in Settings > Audio";
             source.makeSubtitle  = []
             {
                 auto device = settings::get ("hostStreamTalkDevice", "").toString();
-                return device.isNotEmpty() ? device : juce::String ("no talk mic - set one in the Audio tab");
+                return device.isNotEmpty() ? device : juce::String ("no talk mic - set one in Settings > Audio");
             };
             source.getLevel      = [this] { return engine.getStreamOutput().getTalkLevel(); };
             source.getToMic      = [this] { return engine.getStreamOutput().isTalkEnabled(); };
@@ -428,7 +434,7 @@ HostView::HostView()
     sessionPage.addAndMakeVisible (musiciansList);
 
     sessionPage.addAndMakeVisible (chatPanel);
-    chatPanel.setStatusText ("Start the server to chat with the band.");
+    chatPanel.setStatusText ("Start a server (Connect menu) to chat with the band.");
     chatPanel.setTalkAvailable (false);
     chatPanel.getTalkLevel = [this] { return voice.getTalkLevel(); };
     chatPanel.onSendText = [this] (const juce::String& text)
@@ -446,7 +452,7 @@ HostView::HostView()
         if (talk && talkAutoMuted)
         {
             chatPanel.setTalkActive (false);
-            chatPanel.addSystemMessage ("Talk mic is auto-muted right now - turn the toggle off in the Audio tab to talk");
+            chatPanel.addSystemMessage ("Talk mic is auto-muted right now - turn the toggle off in the Audio settings to talk");
             return;
         }
         if (talk && ! voice.isRunning())
@@ -455,7 +461,7 @@ HostView::HostView()
         if (talk && voice.getTalkMicName().isEmpty())
         {
             chatPanel.setTalkActive (false);
-            chatPanel.addSystemMessage ("Select a talk mic in the Audio tab first");
+            chatPanel.addSystemMessage ("Select a talk mic in Settings > Audio first");
         }
     };
 
@@ -468,13 +474,15 @@ HostView::HostView()
     logView.setFont (juce::Font (juce::FontOptions (12.5f)));
     sessionPage.addAndMakeVisible (logView);
 
-    tabs.setTabBarDepth (32);
-    tabs.setOutline (0);
-    tabs.addTab ("Session",      juce::Colours::transparentBlack, &sessionPage, false);
-    tabs.addTab ("Audio",        juce::Colours::transparentBlack, &audioPage, false);
-    tabs.addTab ("Audio Stream", juce::Colours::transparentBlack, &streamPage, false);
-    tabs.addTab ("Recordings",   juce::Colours::transparentBlack, &recordingsPage, false);
-    addAndMakeVisible (tabs);
+    // The session is the main content; Audio, Audio Stream, Recordings and the
+    // port test live in their own tool windows (Connect/Settings menus) so they
+    // can stay open next to the main window.
+    addAndMakeVisible (sessionPage);
+
+    audioWindow      = std::make_unique<ChildWindow> ("Audio - VRC Downbeat",        audioPage,      980, 700);
+    streamWindow     = std::make_unique<ChildWindow> ("Audio Stream - VRC Downbeat", streamPage,     1100, 760);
+    recordingsWindow = std::make_unique<ChildWindow> ("Recordings - VRC Downbeat",   recordingsPage, 1100, 720);
+    portTestWindow   = std::make_unique<ChildWindow> ("Test Port - VRC Downbeat",    portTestPage,   620, 420);
 
     // -- wiring ---------------------------------------------------------------------
     juce::Component::SafePointer<HostView> safe (this);
@@ -561,12 +569,22 @@ HostView::HostView()
         safe->appendLog ("Relay: " + reason);
     };
 
+    engine.onPreviewRecordingSaved = [safe] (juce::File folder)
+    {
+        if (safe != nullptr)
+        {
+            safe->appendLog ("Song recording saved: " + folder.getFullPathName());
+            if (safe->recordingsPanel != nullptr)
+                safe->recordingsPanel->refreshList();
+        }
+    };
+
     engine.onRecordingSaved = [safe] (juce::File folder)
     {
         if (safe != nullptr)
         {
             safe->appendLog ("Recording saved (all stems): " + folder.getFullPathName());
-            safe->jamStatusLabel.setText ("Recording saved - open the Recordings tab to remix and export it.",
+            safe->jamStatusLabel.setText ("Recording saved - open Settings > Recordings to remix and export it.",
                                           juce::dontSendNotification);
             if (safe->recordingsPanel != nullptr)
                 safe->recordingsPanel->refreshList();
@@ -589,6 +607,9 @@ HostView::~HostView()
     stopTimer();
     ++prepareGeneration;   // orphan any in-flight decode
     ++previewGeneration;
+    engine.onPreviewRecordingSaved = nullptr;   // widgets die before the engine
+    engine.stopPreviewRecording();
+    engine.saveInstrumentState();
     stopJam ("Host closed", true);
     voice.stop();          // before server.stop(): its sender uses the server
     server.stop();
@@ -600,49 +621,57 @@ void HostView::paint (juce::Graphics& g)
 {
     g.fillAll (style::background());
 
-    auto area = getLocalBounds().reduced (16);
-    area.removeFromTop (44);
-    style::drawPanel (g, area.removeFromTop (92).toFloat());
+    auto area = getLocalBounds().reduced (16, 10);
+    area.removeFromTop (30 + 6);   // menu row
+    style::drawPanel (g, area.removeFromTop (40).toFloat());
 }
 
 void HostView::resized()
 {
-    auto area = getLocalBounds().reduced (16);
+    auto area = getLocalBounds().reduced (16, 10);
 
-    auto header = area.removeFromTop (36);
-    leaveButton.setBounds (header.removeFromRight (110).reduced (0, 4));
-    headerLabel.setBounds (header);
+    // Menu row: menus on the left, Change Role/Disconnect pinned top-right so
+    // they stay reachable no matter what is going on.
+    auto menuRow = area.removeFromTop (30);
+    leaveButton.setBounds (menuRow.removeFromRight (110).reduced (0, 2));
+    menuRow.removeFromRight (8);
+    disconnectButton.setBounds (menuRow.removeFromRight (110).reduced (0, 2));
+    menuRow.removeFromRight (12);
+    menuBar.setBounds (menuRow.removeFromLeft (juce::jmin (260, menuRow.getWidth())));
+    area.removeFromTop (6);
+
+    // Status strip: role + server status + room code copy.
+    auto status = area.removeFromTop (40).reduced (12, 4);
+    headerLabel.setBounds (status.removeFromLeft (80));
+    status.removeFromLeft (8);
+    copyCodeButton.setBounds (status.removeFromRight (92).reduced (0, 3));
+    status.removeFromRight (8);
+    serverStatusLabel.setBounds (status);
     area.removeFromTop (8);
 
-    // Server panel (two rows)
-    auto serverPanel = area.removeFromTop (92).reduced (12, 10);
-    auto row1 = serverPanel.removeFromTop (32);
-    nameCaption.setBounds (row1.removeFromLeft (50));
-    nameEditor.setBounds (row1.removeFromLeft (130).reduced (0, 2));
-    row1.removeFromLeft (10);
-    portCaption.setBounds (row1.removeFromLeft (44));
-    portEditor.setBounds (row1.removeFromLeft (70).reduced (0, 2));
-    row1.removeFromLeft (10);
-    serverButton.setBounds (row1.removeFromLeft (128).reduced (0, 1));
-    row1.removeFromLeft (8);
-    roomButton.setBounds (row1.removeFromLeft (190).reduced (0, 1));
-    row1.removeFromLeft (8);
-    copyCodeButton.setBounds (row1.removeFromLeft (92).reduced (0, 1));
-    row1.removeFromLeft (10);
-    serverStatusLabel.setBounds (row1);
+    sessionPage.setBounds (area);
+}
 
-    serverPanel.removeFromTop (8);
-    auto row2 = serverPanel.removeFromTop (32);
-    portTestResultLabel.setBounds (row2.removeFromRight (juce::jmin (260, row2.getWidth() / 3)));
-    row2.removeFromRight (8);
-    portTestButton.setBounds (row2.removeFromRight (110).reduced (0, 3));
-    row2.removeFromRight (12);
-    showIpsButton.setBounds (row2.removeFromLeft (90).reduced (0, 3));
-    row2.removeFromLeft (12);
-    ipLabel.setBounds (row2);
+void HostView::layoutPortTestPage()
+{
+    auto area = portTestPage.getLocalBounds().reduced (14, 12);
+
+    portTestHintLabel.setBounds (area.removeFromTop (64));
     area.removeFromTop (8);
 
-    tabs.setBounds (area);
+    auto ipRow = area.removeFromTop (30);
+    showIpsButton.setBounds (ipRow.removeFromLeft (90).reduced (0, 2));
+    ipRow.removeFromLeft (12);
+    ipLabel.setBounds (ipRow);
+    area.removeFromTop (10);
+
+    auto testRow = area.removeFromTop (30);
+    portTestButton.setBounds (testRow.removeFromLeft (110).reduced (0, 1));
+    testRow.removeFromLeft (12);
+    portTestResultLabel.setBounds (testRow);
+    area.removeFromTop (10);
+
+    portTestExplainLabel.setBounds (area);
 }
 
 void HostView::layoutSessionPage()
@@ -745,6 +774,47 @@ void HostView::layoutAudioPage()
     muteTalkOnPlayToggle.setBounds (right.removeFromTop (24));
     right.removeFromTop (2);
     muteTalkOnJamToggle.setBounds (right.removeFromTop (24));
+
+    // Instrument (VST3)
+    right.removeFromTop (16);
+    instCaption.setBounds (right.removeFromTop (24));
+    right.removeFromTop (4);
+    auto instRow = right.removeFromTop (28);
+    instLoadButton.setBounds (instRow.removeFromLeft (110));
+    instRow.removeFromLeft (6);
+    instUiButton.setBounds (instRow.removeFromLeft (90));
+    instRow.removeFromLeft (6);
+    instRemoveButton.setBounds (instRow.removeFromLeft (90));
+    right.removeFromTop (6);
+    loadVstOnStartToggle.setBounds (right.removeFromTop (24));
+    right.removeFromTop (6);
+    auto midiRow = right.removeFromTop (26);
+    midiCaption.setBounds (midiRow.removeFromLeft (70));
+    midiRescanButton.setBounds (midiRow.removeFromRight (80));
+    midiRow.removeFromRight (6);
+    midiInputBox.setBounds (midiRow);
+    right.removeFromTop (4);
+    instStatusLabel.setBounds (right.removeFromTop (20));
+    midiActivityLabel.setBounds (right.removeFromTop (20));
+
+    // Recording
+    right.removeFromTop (16);
+    recSettingsCaption.setBounds (right.removeFromTop (24));
+    right.removeFromTop (4);
+    autoRecordPlayToggle.setBounds (right.removeFromTop (24));
+    right.removeFromTop (2);
+    autoRecordJamToggle.setBounds (right.removeFromTop (24));
+    right.removeFromTop (6);
+    auto folderRow = right.removeFromTop (28);
+    recFolderButton.setBounds (folderRow.removeFromLeft (110));
+    folderRow.removeFromLeft (8);
+    recFolderLabel.setBounds (folderRow);
+    right.removeFromTop (6);
+    auto patternRow = right.removeFromTop (26);
+    recPatternCaption.setBounds (patternRow.removeFromLeft (80));
+    recPatternEditor.setBounds (patternRow.reduced (0, 1));
+    right.removeFromTop (2);
+    recPatternHintLabel.setBounds (right.removeFromTop (20));
 }
 
 void HostView::layoutStreamPage()
@@ -826,6 +896,270 @@ void HostView::refreshTalkMicDevices()
 }
 
 //==============================================================================
+void HostView::initInstrumentControls()
+{
+    style::styleSectionLabel (instCaption, "Instrument (VST3)");
+    audioPage.addAndMakeVisible (instCaption);
+
+    instLoadButton.setButtonText ("Load VST3...");
+    instLoadButton.onClick = [this] { loadInstrumentClicked(); };
+    audioPage.addAndMakeVisible (instLoadButton);
+
+    instUiButton.setButtonText ("Open UI");
+    instUiButton.onClick = [this] { engine.showInstrumentEditor(); };
+    audioPage.addAndMakeVisible (instUiButton);
+
+    instRemoveButton.setButtonText ("Remove");
+    instRemoveButton.onClick = [this]
+    {
+        engine.unloadInstrument();
+        refreshInstrumentUi();
+    };
+    audioPage.addAndMakeVisible (instRemoveButton);
+
+    loadVstOnStartToggle.setButtonText ("Load VST on startup");
+    loadVstOnStartToggle.setToggleState ((bool) settings::get ("hostLoadVstOnStartup", false),
+                                         juce::dontSendNotification);
+    loadVstOnStartToggle.onClick = [this]
+    {
+        settings::set ("hostLoadVstOnStartup", loadVstOnStartToggle.getToggleState());
+    };
+    audioPage.addAndMakeVisible (loadVstOnStartToggle);
+
+    midiCaption.setText ("MIDI in:", juce::dontSendNotification);
+    midiCaption.setColour (juce::Label::textColourId, style::textDim());
+    audioPage.addAndMakeVisible (midiCaption);
+
+    midiInputBox.onChange = [this]
+    {
+        const int index = midiInputBox.getSelectedItemIndex();
+        engine.setMidiInput (juce::isPositiveAndBelow (index - 1, midiInputs.size())
+                                 ? midiInputs.getReference (index - 1).identifier
+                                 : juce::String());
+    };
+    audioPage.addAndMakeVisible (midiInputBox);
+
+    midiRescanButton.setButtonText ("Rescan");
+    midiRescanButton.onClick = [this] { refreshMidiInputs(); };
+    audioPage.addAndMakeVisible (midiRescanButton);
+
+    instStatusLabel.setFont (juce::Font (juce::FontOptions (12.5f)));
+    instStatusLabel.setColour (juce::Label::textColourId, style::textDim());
+    audioPage.addAndMakeVisible (instStatusLabel);
+
+    midiActivityLabel.setFont (juce::Font (juce::FontOptions (12.5f)));
+    midiActivityLabel.setColour (juce::Label::textColourId, style::textDim());
+    midiActivityLabel.setJustificationType (juce::Justification::centredRight);
+    audioPage.addAndMakeVisible (midiActivityLabel);
+
+    // Only restore the saved plugin when the user opted in.
+    if ((bool) settings::get ("hostLoadVstOnStartup", false))
+        if (const auto saved = engine.getSavedInstrumentFile(); saved.exists())
+        {
+            juce::String error;
+            engine.loadInstrument (saved, error);
+        }
+
+    refreshMidiInputs();
+    refreshInstrumentUi();
+}
+
+void HostView::refreshInstrumentUi()
+{
+    const bool loaded = engine.hasInstrument();
+
+    instStatusLabel.setText (loaded
+                                 ? "Loaded: " + engine.getInstrumentName()
+                                   + " (mixed into your output, stream and recordings)"
+                                 : "No plugin - only the hardware input is used.",
+                             juce::dontSendNotification);
+    instStatusLabel.setColour (juce::Label::textColourId, loaded ? style::good() : style::textDim());
+    instUiButton.setEnabled (loaded);
+    instRemoveButton.setEnabled (loaded);
+}
+
+void HostView::refreshMidiInputs()
+{
+    midiInputs = HostMixEngine::getMidiInputs();
+
+    midiInputBox.clear (juce::dontSendNotification);
+    midiInputBox.addItem ("(none)", 1);
+    for (int i = 0; i < midiInputs.size(); ++i)
+        midiInputBox.addItem (midiInputs.getReference (i).name, i + 2);
+
+    const auto saved = engine.getMidiInputIdentifier().isNotEmpty()
+                           ? engine.getMidiInputIdentifier()
+                           : settings::get ("host_midiInput", "").toString();
+
+    int selected = 0;
+    for (int i = 0; i < midiInputs.size(); ++i)
+        if (midiInputs.getReference (i).identifier == saved)
+            { selected = i + 1; break; }
+
+    midiInputBox.setSelectedItemIndex (selected, juce::dontSendNotification);
+
+    // Always (re)open the port: a rescan is also the retry after another
+    // program released it.
+    engine.setMidiInput (selected > 0 ? saved : juce::String());
+}
+
+void HostView::loadInstrumentClicked()
+{
+    const auto defaultFolder = juce::File ("C:\\Program Files\\Common Files\\VST3");
+
+    instChooser = std::make_unique<juce::FileChooser> (
+        "Choose a VST3 instrument (e.g. Superior Drummer 3)",
+        defaultFolder.isDirectory() ? defaultFolder
+                                    : juce::File::getSpecialLocation (juce::File::userHomeDirectory),
+        "*.vst3");
+
+    juce::Component::SafePointer<HostView> safe (this);
+    instChooser->launchAsync (juce::FileBrowserComponent::openMode
+                                  | juce::FileBrowserComponent::canSelectFiles
+                                  | juce::FileBrowserComponent::canSelectDirectories,
+                              [safe] (const juce::FileChooser& chooser)
+    {
+        if (safe == nullptr)
+            return;
+
+        const auto file = chooser.getResult();
+        if (file == juce::File())
+            return;
+
+        safe->instStatusLabel.setText ("Loading plugin...", juce::dontSendNotification);
+
+        juce::String error;
+        if (! safe->engine.loadInstrument (file, error))
+        {
+            safe->refreshInstrumentUi();
+            safe->instStatusLabel.setText (error, juce::dontSendNotification);
+            safe->instStatusLabel.setColour (juce::Label::textColourId, style::warn());
+            return;
+        }
+
+        safe->refreshMidiInputs();
+        safe->refreshInstrumentUi();
+        safe->engine.showInstrumentEditor();
+    });
+}
+
+//==============================================================================
+void HostView::initRecordingControls()
+{
+    style::styleSectionLabel (recSettingsCaption, "Recording");
+    audioPage.addAndMakeVisible (recSettingsCaption);
+
+    autoRecordOnPlay = (bool) settings::get ("autoRecordOnPreview", false);
+    autoRecordOnJam  = (bool) settings::get ("autoRecordOnJam", false);
+
+    autoRecordPlayToggle.setButtonText ("Auto-record while a song plays");
+    autoRecordPlayToggle.setToggleState (autoRecordOnPlay, juce::dontSendNotification);
+    autoRecordPlayToggle.onClick = [this]
+    {
+        autoRecordOnPlay = autoRecordPlayToggle.getToggleState();
+        settings::set ("autoRecordOnPreview", autoRecordOnPlay);
+        updatePreviewAutoRecord();
+    };
+    audioPage.addAndMakeVisible (autoRecordPlayToggle);
+
+    autoRecordJamToggle.setButtonText ("Auto-record during a jam");
+    autoRecordJamToggle.setToggleState (autoRecordOnJam, juce::dontSendNotification);
+    autoRecordJamToggle.onClick = [this]
+    {
+        autoRecordOnJam = autoRecordJamToggle.getToggleState();
+        settings::set ("autoRecordOnJam", autoRecordOnJam);
+    };
+    audioPage.addAndMakeVisible (autoRecordJamToggle);
+
+    recFolderButton.setButtonText ("Save to...");
+    recFolderButton.setTooltip ("Choose the folder where recordings are saved "
+                                "(the Recordings window shows this folder).");
+    recFolderButton.onClick = [this]
+    {
+        recFolderChooser = std::make_unique<juce::FileChooser> (
+            "Choose the recordings folder", settings::recordingsFolder());
+
+        juce::Component::SafePointer<HostView> safe (this);
+        recFolderChooser->launchAsync (juce::FileBrowserComponent::openMode
+                                           | juce::FileBrowserComponent::canSelectDirectories,
+                                       [safe] (const juce::FileChooser& chooser)
+        {
+            if (safe == nullptr)
+                return;
+
+            const auto folder = chooser.getResult();
+            if (folder == juce::File() || ! folder.isDirectory())
+                return;
+
+            settings::set ("recordingsFolder", folder.getFullPathName());
+            safe->refreshRecordingFolderLabel();
+            if (safe->recordingsPanel != nullptr)
+                safe->recordingsPanel->refreshList();
+        });
+    };
+    audioPage.addAndMakeVisible (recFolderButton);
+
+    recFolderLabel.setFont (juce::Font (juce::FontOptions (12.5f)));
+    recFolderLabel.setColour (juce::Label::textColourId, style::textDim());
+    recFolderLabel.setMinimumHorizontalScale (0.7f);
+    audioPage.addAndMakeVisible (recFolderLabel);
+    refreshRecordingFolderLabel();
+
+    recPatternCaption.setText ("File name:", juce::dontSendNotification);
+    recPatternCaption.setColour (juce::Label::textColourId, style::textDim());
+    audioPage.addAndMakeVisible (recPatternCaption);
+
+    recPatternEditor.setText (settings::get ("recordingNamePattern", "{song}_{date}_{time}").toString(),
+                              juce::dontSendNotification);
+    recPatternEditor.onTextChange = [this]
+    {
+        settings::set ("recordingNamePattern", recPatternEditor.getText());
+    };
+    audioPage.addAndMakeVisible (recPatternEditor);
+
+    recPatternHintLabel.setText ("Placeholders: {song}  {date}  {time}", juce::dontSendNotification);
+    recPatternHintLabel.setFont (juce::Font (juce::FontOptions (12.0f)));
+    recPatternHintLabel.setColour (juce::Label::textColourId, style::textDim());
+    audioPage.addAndMakeVisible (recPatternHintLabel);
+}
+
+void HostView::refreshRecordingFolderLabel()
+{
+    recFolderLabel.setText (settings::recordingsFolder().getFullPathName(), juce::dontSendNotification);
+}
+
+void HostView::updatePreviewAutoRecord()
+{
+    // Start when the preview starts playing, stop when it pauses/stops or
+    // the toggle goes off (fires from the UI timer).
+    const bool playing = phase == Phase::idle && engine.isPreviewPlaying();
+
+    if (autoRecordOnPlay && playing && ! engine.isPreviewRecording())
+    {
+        if (previewRecFailed)
+            return;   // don't retry (and spam the log) until playback restarts
+
+        juce::String error;
+        if (engine.startPreviewRecording (error))
+        {
+            appendLog ("Auto-record: recording \"" + engine.getPreviewName() + "\"");
+        }
+        else
+        {
+            previewRecFailed = true;
+            appendLog ("Auto-record failed: " + error);
+        }
+    }
+    else if (engine.isPreviewRecording() && (! playing || ! autoRecordOnPlay))
+    {
+        engine.stopPreviewRecording();
+    }
+
+    if (! playing)
+        previewRecFailed = false;
+}
+
+//==============================================================================
 // songs list
 int HostView::getNumRows() { return library.getSongs().size(); }
 
@@ -879,27 +1213,116 @@ void HostView::updateStemInfo()
 }
 
 //==============================================================================
-void HostView::toggleServer()
+// Connect / Settings menus
+juce::StringArray HostView::getMenuBarNames()
+{
+    return { "Connect", "Settings" };
+}
+
+juce::PopupMenu HostView::getMenuForIndex (int menuIndex, const juce::String&)
+{
+    juce::PopupMenu menu;
+
+    if (menuIndex == 0)   // Connect
+    {
+        const bool idle = ! server.isRunning();
+        menu.addItem (1, "Host Server...", idle);
+        menu.addItem (2, "Host Downbeat Server...", idle);
+        menu.addSeparator();
+        menu.addItem (3, "Test Port...");
+    }
+    else if (menuIndex == 1)   // Settings
+    {
+        menu.addItem (11, "Audio");
+        menu.addItem (12, "Audio Stream");
+        menu.addItem (13, "Recordings");
+    }
+    return menu;
+}
+
+void HostView::menuItemSelected (int menuItemID, int)
+{
+    switch (menuItemID)
+    {
+        case 1:  showHostServerDialog();      break;
+        case 2:  showRoomServerDialog();      break;
+        case 3:  portTestWindow->open();      break;
+        case 11: audioWindow->open();         break;
+        case 12: streamWindow->open();        break;
+        case 13: recordingsWindow->open();    break;
+        default: break;
+    }
+}
+
+void HostView::showHostServerDialog()
 {
     if (server.isRunning())
-    {
-        stopHosting();
-        return;
-    }
-
-    if (! applyHostName())
         return;
 
-    const int port = juce::jlimit (1, 65535, portEditor.getText().getIntValue());
+    auto* window = new juce::AlertWindow ("Host Server",
+                                          "Runs the server on your own PC. Musicians connect directly "
+                                          "to your IP and port (port forwarding may be needed - "
+                                          "use Connect > Test Port to check).",
+                                          juce::MessageBoxIconType::NoIcon);
+    window->addTextEditor ("name", settings::get ("hostName", "").toString(), "Your name:");
+    window->addTextEditor ("port", settings::get ("hostPort", kDefaultPort).toString(), "TCP port:");
+    window->getTextEditor ("name")->setInputRestrictions (24);
+    window->getTextEditor ("port")->setInputRestrictions (5, "0123456789");
+    window->addButton ("Start", 1, juce::KeyPress (juce::KeyPress::returnKey));
+    window->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+
+    juce::Component::SafePointer<HostView> safe (this);
+    window->enterModalState (true,
+        juce::ModalCallbackFunction::create ([safe, window] (int result)
+        {
+            if (safe == nullptr || result != 1)
+                return;
+
+            const auto name = window->getTextEditorContents ("name").trim();
+            const int  port = juce::jlimit (1, 65535, window->getTextEditorContents ("port").getIntValue());
+            safe->startOwnServer (name, port);
+        }),
+        true);
+}
+
+void HostView::showRoomServerDialog()
+{
+    if (server.isRunning())
+        return;
+
+    auto* window = new juce::AlertWindow ("Host Downbeat Server",
+                                          "Opens a room on the Downbeat relay server. Musicians join "
+                                          "with the room code - no port forwarding, no IP sharing "
+                                          "on either side.",
+                                          juce::MessageBoxIconType::NoIcon);
+    window->addTextEditor ("name", settings::get ("hostName", "").toString(), "Your name:");
+    window->getTextEditor ("name")->setInputRestrictions (24);
+    window->addButton ("Open room", 1, juce::KeyPress (juce::KeyPress::returnKey));
+    window->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+
+    juce::Component::SafePointer<HostView> safe (this);
+    window->enterModalState (true,
+        juce::ModalCallbackFunction::create ([safe, window] (int result)
+        {
+            if (safe == nullptr || result != 1)
+                return;
+
+            safe->startRoomServer (window->getTextEditorContents ("name").trim());
+        }),
+        true);
+}
+
+void HostView::startOwnServer (const juce::String& name, int port)
+{
+    if (server.isRunning() || ! applyHostName (name))
+        return;
+
     juce::String error;
     if (server.start (port, error))
     {
         settings::set ("hostPort", port);
-        serverButton.setButtonText ("Stop own Server");
-        roomButton.setEnabled (false);
         serverStatusLabel.setText ("Running on port " + juce::String (port), juce::dontSendNotification);
         serverStatusLabel.setColour (juce::Label::textColourId, style::good());
-        portTestButton.setEnabled (true);
         onHostingStarted();
     }
     else
@@ -907,24 +1330,17 @@ void HostView::toggleServer()
         serverStatusLabel.setText (error, juce::dontSendNotification);
         serverStatusLabel.setColour (juce::Label::textColourId, style::bad());
     }
+    updateConnectUi();
     updateJamButtons();
 }
 
-void HostView::toggleRoom()
+void HostView::startRoomServer (const juce::String& name)
 {
-    if (server.isRunning())
-    {
-        stopHosting();
-        return;
-    }
-
-    if (! applyHostName())
+    if (server.isRunning() || ! applyHostName (name))
         return;
 
     relayMode = true;
     server.startVirtual();
-    roomButton.setButtonText ("Close room");
-    serverButton.setEnabled (false);
     serverStatusLabel.setText ("Opening a room on the relay server...", juce::dontSendNotification);
     serverStatusLabel.setColour (juce::Label::textColourId, style::textDim());
 
@@ -933,17 +1349,16 @@ void HostView::toggleRoom()
     relay::parseAddress (settings::get ("relayAddress", juce::String (relay::kDefaultAddress)).toString(),
                          relayHost, relayPort);
     relayLink.open (relayHost, relayPort, server.getHostName());
+    updateConnectUi();
     updateJamButtons();
 }
 
-bool HostView::applyHostName()
+bool HostView::applyHostName (const juce::String& name)
 {
-    const auto name = nameEditor.getText().trim();
     if (name.isEmpty())
     {
         serverStatusLabel.setText ("Please enter a name first.", juce::dontSendNotification);
         serverStatusLabel.setColour (juce::Label::textColourId, style::warn());
-        nameEditor.grabKeyboardFocus();
         return false;
     }
 
@@ -960,29 +1375,33 @@ void HostView::stopHosting (bool showOff)
     server.stop();
     relayMode = false;
 
-    serverButton.setButtonText ("Start own Server");
-    serverButton.setEnabled (true);
-    roomButton.setButtonText ("Host via Downbeat Server");
-    roomButton.setEnabled (true);
-    copyCodeButton.setVisible (false);
-    portTestButton.setEnabled (false);
-
     if (showOff)
     {
-        serverStatusLabel.setText ("Server is off", juce::dontSendNotification);
+        serverStatusLabel.setText ("Server is off - use the Connect menu to start hosting",
+                                   juce::dontSendNotification);
         serverStatusLabel.setColour (juce::Label::textColourId, style::textDim());
     }
 
     chatPanel.setTalkAvailable (false);
-    chatPanel.setStatusText ("Start the server to chat with the band.");
+    chatPanel.setStatusText ("Start a server (Connect menu) to chat with the band.");
+    updateConnectUi();
     updateJamButtons();
 }
 
 void HostView::onHostingStarted()
 {
     chatPanel.setTalkAvailable (true);
-    chatPanel.setStatusText ("Talk uses the talk mic from the Audio tab.");
+    chatPanel.setStatusText ("Talk uses the talk mic from the Audio settings.");
     startVoice();   // hear the band's voice chat right away
+    updateConnectUi();
+}
+
+void HostView::updateConnectUi()
+{
+    const bool running = server.isRunning();
+    disconnectButton.setVisible (running);
+    copyCodeButton.setVisible (running && relayMode && relayLink.getRoomCode().isNotEmpty());
+    portTestButton.setEnabled (running && ! relayMode && ! portTestRunning);
 }
 
 void HostView::startVoice()
@@ -1108,14 +1527,28 @@ namespace
 
 void HostView::testPortClicked()
 {
-    if (portTestRunning || ! server.isRunning())
+    if (portTestRunning)
         return;
+
+    if (! server.isRunning() || relayMode)
+    {
+        portTestResultLabel.setText ("Server is not running.", juce::dontSendNotification);
+        portTestResultLabel.setColour (juce::Label::textColourId, style::warn());
+        portTestExplainLabel.setText ("Nothing is listening on your port right now, so a test would "
+                                      "always fail. Start \"Host Server\" from the Connect menu first, "
+                                      "then run the test.",
+                                      juce::dontSendNotification);
+        return;
+    }
 
     if (publicIp.isEmpty() || publicIp == "not detectable")
     {
         portTestResultLabel.setText ("Public IP unknown - can't run the test.",
                                      juce::dontSendNotification);
         portTestResultLabel.setColour (juce::Label::textColourId, style::warn());
+        portTestExplainLabel.setText ("Your public IP address could not be detected yet. Check that "
+                                      "your internet connection works, wait a moment and try again.",
+                                      juce::dontSendNotification);
         fetchPublicIp();
         return;
     }
@@ -1124,43 +1557,71 @@ void HostView::testPortClicked()
     portTestButton.setEnabled (false);
     portTestResultLabel.setText ("Testing... (up to 15 s)", juce::dontSendNotification);
     portTestResultLabel.setColour (juce::Label::textColourId, style::textDim());
+    portTestExplainLabel.setText ("An external service (check-host.net) is trying to open a TCP "
+                                  "connection to your public IP on port "
+                                  + juce::String (server.getPort()) + " - exactly what a musician's "
+                                  "app would do.",
+                                  juce::dontSendNotification);
 
     juce::Component::SafePointer<HostView> safe (this);
     juce::Thread::launch ([safe, ip = publicIp, port = server.getPort()]
     {
         const auto verdict = runExternalPortTest (ip, port);
 
-        juce::MessageManager::callAsync ([safe, verdict]
+        juce::MessageManager::callAsync ([safe, verdict, port]
         {
             if (safe == nullptr) return;
 
             safe->portTestRunning = false;
-            safe->portTestButton.setEnabled (safe->server.isRunning());
+            safe->updateConnectUi();
 
-            juce::String text;
+            juce::String text, why;
             juce::Colour colour;
             if (verdict == "open")
             {
-                text   = "Port open - reachable from outside!";
+                text   = "Port open - musicians can connect!";
                 colour = style::good();
+                why    = "The test service reached your server from the internet. Your router "
+                         "forwards TCP port " + juce::String (port) + " correctly and no firewall "
+                         "is blocking it. Give musicians your public IP and this port.";
             }
             else if (verdict == "closed")
             {
-                text   = "Port closed! Check the port forwarding in your router.";
+                text   = "Port closed - connection was refused.";
                 colour = style::bad();
+                why    = "The test reached your network, but nothing answered on port "
+                         + juce::String (port) + ". Most likely the router has no port forwarding "
+                         "rule for this port, or it points to the wrong PC.\n\n"
+                         "How to fix:\n"
+                         "1. In your router, forward TCP port " + juce::String (port) + " to this PC's "
+                         "local IP (see above, \"Show IPs\").\n"
+                         "2. Allow VRC Downbeat in the Windows Firewall.\n"
+                         "3. Alternatively skip all of this and use \"Host Downbeat Server\" - "
+                         "it needs no open port.";
             }
             else if (verdict == "timeout")
             {
-                text   = "No answer from the test service.";
-                colour = style::warn();
+                text   = "No answer - the connection attempt timed out.";
+                colour = style::bad();
+                why    = "The connection attempt was silently dropped. Typical causes:\n"
+                         "- No port forwarding rule, and the router drops unknown traffic.\n"
+                         "- Your ISP uses CGNAT / DS-Lite (shared public IP): incoming connections "
+                         "are impossible, no router setting can fix that.\n\n"
+                         "If port forwarding is set up correctly and it still times out, you are "
+                         "probably behind CGNAT - use \"Host Downbeat Server\" instead, it works "
+                         "without any open port.";
             }
             else
             {
                 text   = "Test service not reachable.";
                 colour = style::warn();
+                why    = "The external test service (check-host.net) could not be contacted. This "
+                         "says nothing about your port - your own internet connection may be down, "
+                         "or the service is temporarily offline. Try again in a minute.";
             }
             safe->portTestResultLabel.setText (text, juce::dontSendNotification);
             safe->portTestResultLabel.setColour (juce::Label::textColourId, colour);
+            safe->portTestExplainLabel.setText (why, juce::dontSendNotification);
         });
     });
 }
@@ -1259,7 +1720,7 @@ void HostView::previewLoadClicked()
         targetRate = device->getCurrentSampleRate();
     if (targetRate <= 0.0)
     {
-        jamStatusLabel.setText ("No audio device active - check the Audio tab.", juce::dontSendNotification);
+        jamStatusLabel.setText ("No audio device active - check Settings > Audio.", juce::dontSendNotification);
         return;
     }
 
@@ -1494,9 +1955,11 @@ void HostView::goLive()
     phase = Phase::running;
     countdownLabel.setVisible (false);
 
-    engine.startJamPlayback (recordToggle.getToggleState());
-    if (recordToggle.getToggleState())
-        appendLog ("Recording stems into: " + engine.getRecordingFolder().getFullPathName());
+    const bool record = recordToggle.getToggleState() || autoRecordOnJam;
+    engine.startJamPlayback (record);
+    if (record)
+        appendLog (juce::String (autoRecordOnJam && ! recordToggle.getToggleState() ? "Auto-record: " : "")
+                   + "Recording stems into: " + engine.getRecordingFolder().getFullPathName());
 
     auto* obj = new juce::DynamicObject();
     obj->setProperty ("jamId", jamId);
@@ -1710,6 +2173,44 @@ void HostView::timerCallback()
         if (++stateBroadcastTick % 30 == 0)
             broadcastJamState();
 
+    // MIDI activity for the VST instrument (Audio settings).
+    if (engine.hasInstrument())
+    {
+        juce::String text;
+        juce::Colour colour;
+
+        if (engine.getMidiInputIdentifier().isEmpty())
+        {
+            text   = "no MIDI port selected";
+            colour = style::warn();
+        }
+        else if (engine.midiOpenFailed())
+        {
+            text   = "MIDI port busy - close other app, Rescan";
+            colour = style::bad();
+        }
+        else if (engine.getMidiEventCount() == 0)
+        {
+            text   = "MIDI: no events yet";
+            colour = style::textDim();
+        }
+        else
+        {
+            text = "MIDI ok - " + juce::String (engine.getMidiEventCount()) + " events";
+            if (engine.getLastMidiNote() >= 0)
+                text += ", last note " + juce::String (engine.getLastMidiNote());
+            colour = style::good();
+        }
+
+        midiActivityLabel.setText (text, juce::dontSendNotification);
+        midiActivityLabel.setColour (juce::Label::textColourId, colour);
+    }
+    else if (midiActivityLabel.getText().isNotEmpty())
+    {
+        midiActivityLabel.setText ({}, juce::dontSendNotification);
+    }
+
+    updatePreviewAutoRecord();
     updateTalkAutoMute();
 }
 

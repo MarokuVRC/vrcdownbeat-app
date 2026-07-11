@@ -5,6 +5,7 @@
 #include "common/SongLoader.h"
 #include "common/StreamOutput.h"
 #include "common/StreamingResampler.h"
+#include "musician/InstrumentHost.h"
 #include <atomic>
 #include <functional>
 
@@ -54,6 +55,22 @@ public:
     void  setHostInputMute (bool mute)  { hostInMute.store (mute); }
     float getHostInputLevel() const noexcept { return hostInLevel.load(); }
 
+    // -- VST instrument (rendered inside the callback, part of the host input) ------
+    bool loadInstrument (const juce::File& vst3File, juce::String& error);
+    void unloadInstrument();
+    bool hasInstrument() const noexcept { return instrument.isLoaded(); }
+    juce::String getInstrumentName() const { return instrument.getPluginName(); }
+    juce::File getSavedInstrumentFile() const { return instrument.getSavedPluginFile(); }
+    void showInstrumentEditor() { instrument.showEditor(); }
+    void saveInstrumentState() const { instrument.saveState(); }
+
+    static juce::Array<juce::MidiDeviceInfo> getMidiInputs() { return InstrumentHost::getMidiInputs(); }
+    void setMidiInput (const juce::String& identifier) { instrument.setMidiInput (identifier); }
+    juce::String getMidiInputIdentifier() const { return instrument.getMidiInputIdentifier(); }
+    bool midiOpenFailed() const noexcept { return instrument.midiOpenFailed(); }
+    juce::uint32 getMidiEventCount() const noexcept { return instrument.getMidiEventCount(); }
+    int getLastMidiNote() const noexcept { return instrument.getLastMidiNote(); }
+
     /** What the VRChat/virtual-mic stream contains ("Audio Stream" tab):
         the band mix (jam/preview playback) and the host's own input are
         included independently of the local monitor mute. */
@@ -86,6 +103,15 @@ public:
     void         setPreviewStemGainDb (int index, float gainDb);
     void         setPreviewStemMute (int index, bool mute);
     float        getPreviewStemLevel (int index) const;
+
+    // -- preview recording (auto-record while a song plays) --------------------------
+    /** Records the local output mix (preview playback + host input/VST) into
+        a stereo WAV in a fresh recording folder. Message thread. */
+    bool startPreviewRecording (juce::String& error);
+    /** Finalises the WAV + meta.json and fires onPreviewRecordingSaved. */
+    void stopPreviewRecording();
+    bool isPreviewRecording() const noexcept { return previewRecActive.load(); }
+    std::function<void (juce::File)> onPreviewRecordingSaved;
 
     /** Adopts pre-decoded stems (at song rate), opens the output device and
         creates one stream per expected musician, then enters monitor state
@@ -196,6 +222,8 @@ private:
     PerformerStream* findStream (const juce::String& performerName) const;
 
     void changeListenerCallback (juce::ChangeBroadcaster*) override;
+    std::unique_ptr<juce::AudioFormatWriter::ThreadedWriter>
+        makeThreadedWriter (const juce::File& file, double sampleRate, int channels);
 
     void renderChunk (State st, float* left, float* right, int numSamples);
     /** Final jam mix in song time; advances playPos; feeds the recorder. */
@@ -232,6 +260,13 @@ private:
     std::atomic<bool>  hostInMute  { true };
     std::atomic<float> hostInLevel { 0.0f };
     bool deviceInitialised { false };
+
+    // Optional VST3 instrument: rendered in the callback and added to the
+    // hardware input - together they form the "host input" that feeds the
+    // local output, the VRChat stream and the recording.
+    InstrumentHost instrument { "host_" };
+    juce::HeapBlock<float> hostInL, hostInR;   ///< scratch: hardware input + instrument
+    int hostInCapacity { 0 };
 
     // Bridges the host input (device rate) into the recording (song rate).
     StreamingResampler hostRecResamplerL, hostRecResamplerR;
@@ -272,6 +307,12 @@ private:
     RecordTrack* hostRecordTrack { nullptr };
     std::atomic<bool> recordingActive { false };
     juce::File recordingDir;
+
+    // Preview recording: one stereo WAV of the local output mix.
+    std::unique_ptr<juce::AudioFormatWriter::ThreadedWriter> previewRecWriter;
+    std::atomic<bool> previewRecActive { false };
+    std::atomic<juce::int64> previewRecSamples { 0 };
+    juce::File previewRecDir;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (HostMixEngine)
 };

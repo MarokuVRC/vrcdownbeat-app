@@ -23,7 +23,10 @@ namespace bandjam
 class InstrumentHost : private juce::MidiInputCallback
 {
 public:
-    InstrumentHost();
+    /** settingsPrefix separates the persisted plugin/MIDI choice per role
+        (musician uses no prefix - existing settings keep working - the host
+        engine passes "host"). */
+    explicit InstrumentHost (const juce::String& settingsPrefix = {});
     ~InstrumentHost();
 
     // -- plugin (message thread, callback suspended) -----------------------------
@@ -63,6 +66,9 @@ private:
 
     void handleIncomingMidiMessage (juce::MidiInput*, const juce::MidiMessage&) override;
 
+    juce::String key (const char* name) const { return keyPrefix + name; }
+
+    juce::String keyPrefix;
     juce::AudioPluginFormatManager formatManager;
     std::unique_ptr<juce::AudioPluginInstance> plugin;
     std::unique_ptr<EditorWindow> editorWindow;

@@ -1,5 +1,6 @@
 #include "RecordingsPanel.h"
 #include "common/AppPaths.h"
+#include "common/Settings.h"
 #include "common/Mp3Encoder.h"
 #include "ui/Style.h"
 #include <cmath>
@@ -55,7 +56,7 @@ RecordingsPanel::RecordingsPanel (Options optionsToUse)
         if (juce::isPositiveAndBelow (row, (int) entries.size()))
             entries[(size_t) row].dir.revealToUser();
         else
-            paths::recordingsRoot().revealToUser();
+            settings::recordingsFolder().revealToUser();
     };
     addAndMakeVisible (openFolderButton);
 
@@ -94,7 +95,7 @@ RecordingsPanel::RecordingsPanel (Options optionsToUse)
     statusLabel.setColour (juce::Label::textColourId, style::textDim());
     statusLabel.setText (options.showAutoReceiveToggle
                              ? "Recordings you receive from the host show up here."
-                             : "Record a jam in the Session tab (enable \"Record\"), then load it here.",
+                             : "Record a jam (enable \"Record\") or a song (auto-record in Settings > Audio), then load it here.",
                          juce::dontSendNotification);
     addAndMakeVisible (statusLabel);
 
@@ -159,7 +160,7 @@ void RecordingsPanel::refreshList()
 {
     entries.clear();
 
-    for (const auto& dir : paths::recordingsRoot().findChildFiles (juce::File::findDirectories, false))
+    for (const auto& dir : settings::recordingsFolder().findChildFiles (juce::File::findDirectories, false))
     {
         if (dir.getFileName().endsWithIgnoreCase (".part"))
             continue;   // half-received transfer
@@ -273,7 +274,7 @@ void RecordingsPanel::loadClicked()
     const double targetRate = options.player.getDeviceSampleRate();
     if (targetRate <= 0.0)
     {
-        setStatus ("No audio device active - check the Audio tab.", style::bad());
+        setStatus ("No audio device active - check Settings > Audio.", style::bad());
         return;
     }
 

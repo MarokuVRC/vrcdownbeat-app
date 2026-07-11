@@ -60,10 +60,12 @@ void HostMixEngine::PerformerStream::consume (juce::int64 position, float* dest,
 //==============================================================================
 HostMixEngine::~HostMixEngine()
 {
+    stopPreviewRecording();
     stopAndClose();
     deviceManager.removeChangeListener (this);
     deviceManager.removeAudioCallback (this);
     deviceManager.closeAudioDevice();
+    instrument.unloadPlugin();
 }
 
 void HostMixEngine::initialiseDevice()
@@ -138,6 +140,7 @@ bool HostMixEngine::adoptPreview (const juce::String& previewNameToUse,
 
 void HostMixEngine::unloadPreview()
 {
+    stopPreviewRecording();
     previewPlaying.store (false);
     if (! previewLoaded.exchange (false) && previewStems.isEmpty())
         return;
@@ -192,6 +195,116 @@ double HostMixEngine::getPreviewPositionSeconds() const
 double HostMixEngine::getPreviewLengthSeconds() const
 {
     return previewRate > 0.0 ? (double) previewLength / previewRate : 0.0;
+}
+
+//==============================================================================
+bool HostMixEngine::loadInstrument (const juce::File& vst3File, juce::String& error)
+{
+    auto* device = deviceManager.getCurrentAudioDevice();
+    const double rate = device != nullptr ? device->getCurrentSampleRate() : 44100.0;
+    const int    size = device != nullptr ? device->getCurrentBufferSizeSamples() : 512;
+
+    deviceManager.removeAudioCallback (this);   // blocks until the callback returns
+    const bool ok = instrument.loadPlugin (vst3File, rate, juce::jmax (2048, size), error);
+    if (deviceInitialised)
+        deviceManager.addAudioCallback (this);
+    return ok;
+}
+
+void HostMixEngine::unloadInstrument()
+{
+    deviceManager.removeAudioCallback (this);
+    instrument.unloadPlugin();
+    if (deviceInitialised)
+        deviceManager.addAudioCallback (this);
+}
+
+//==============================================================================
+std::unique_ptr<juce::AudioFormatWriter::ThreadedWriter>
+HostMixEngine::makeThreadedWriter (const juce::File& file, double sampleRate, int channels)
+{
+    juce::WavAudioFormat wavFormat;
+    auto stream = std::make_unique<juce::FileOutputStream> (file);
+    if (! stream->openedOk())
+        return nullptr;
+    if (auto* writer = wavFormat.createWriterFor (stream.get(), sampleRate, (unsigned int) channels, 24, {}, 0))
+    {
+        stream.release(); // now owned by the writer
+        return std::make_unique<juce::AudioFormatWriter::ThreadedWriter> (writer, recordThread, 1 << 17);
+    }
+    return nullptr;
+}
+
+bool HostMixEngine::startPreviewRecording (juce::String& error)
+{
+    if (previewRecActive.load())
+        return true;
+
+    if (! previewLoaded.load())
+    {
+        error = "No song loaded.";
+        return false;
+    }
+
+    auto dir = settings::recordingsFolder().getChildFile (settings::makeRecordingFolderName (previewName));
+    if (dir.exists())
+        dir = dir.getNonexistentSibling (false);
+    if (! dir.createDirectory())
+    {
+        error = "Could not create the recording folder: " + dir.getFullPathName();
+        return false;
+    }
+
+    recordThread.startThread();
+    auto writer = makeThreadedWriter (dir.getChildFile ("mix.wav"), deviceRate, 2);
+    if (writer == nullptr)
+    {
+        error = "Could not create the WAV file in " + dir.getFullPathName();
+        dir.deleteRecursively();
+        return false;
+    }
+
+    // Writer exists before the flag flips, so the audio thread never races it.
+    previewRecDir = dir;
+    previewRecWriter = std::move (writer);
+    previewRecSamples.store (0);
+    previewRecActive.store (true);
+    return true;
+}
+
+void HostMixEngine::stopPreviewRecording()
+{
+    if (! previewRecActive.exchange (false))
+        return;
+
+    deviceManager.removeAudioCallback (this);   // blocks until the callback returns
+    previewRecWriter.reset();                   // flushes + finalises the WAV
+    if (deviceInitialised)
+        deviceManager.addAudioCallback (this);
+
+    const auto dir = previewRecDir;
+    const auto len = previewRecSamples.load();
+    previewRecDir = juce::File();
+
+    juce::Array<juce::var> tracks;
+    {
+        auto* obj = new juce::DynamicObject();
+        obj->setProperty ("file", "mix.wav");
+        obj->setProperty ("name", "Mix");
+        obj->setProperty ("kind", "stem");
+        tracks.add (juce::var (obj));
+    }
+
+    auto* meta = new juce::DynamicObject();
+    meta->setProperty ("song", previewName.isNotEmpty() ? previewName : juce::String ("Recording"));
+    meta->setProperty ("date", juce::Time::getCurrentTime().formatted ("%Y-%m-%d %H:%M"));
+    meta->setProperty ("sampleRate", deviceRate);
+    meta->setProperty ("lengthSamples", (juce::int64) len);
+    meta->setProperty ("tracks", tracks);
+    dir.getChildFile ("meta.json").replaceWithText (juce::JSON::toString (juce::var (meta)));
+
+    if (onPreviewRecordingSaved != nullptr)
+        onPreviewRecordingSaved (dir);
 }
 
 //==============================================================================
@@ -291,32 +404,18 @@ void HostMixEngine::startJamPlayback (bool recordToFile)
     // visible) before the audio thread can ever reach the playing state.
     if (recordToFile)
     {
-        recordingDir = paths::recordingsRoot().getChildFile (
-            paths::safeFileName (songName) + "_"
-            + juce::Time::getCurrentTime().formatted ("%Y-%m-%d_%H-%M-%S"));
+        recordingDir = settings::recordingsFolder().getChildFile (
+            settings::makeRecordingFolderName (songName));
+        if (recordingDir.exists())
+            recordingDir = recordingDir.getNonexistentSibling (false);
         recordingDir.createDirectory();
 
         if (recordingDir.isDirectory())
         {
             recordThread.startThread();
 
-            auto makeWriter = [this] (const juce::File& file, int channels)
-                -> std::unique_ptr<juce::AudioFormatWriter::ThreadedWriter>
-            {
-                juce::WavAudioFormat wavFormat;
-                auto stream = std::make_unique<juce::FileOutputStream> (file);
-                if (! stream->openedOk())
-                    return nullptr;
-                if (auto* writer = wavFormat.createWriterFor (stream.get(), songRate, (unsigned int) channels, 24, {}, 0))
-                {
-                    stream.release(); // now owned by the writer
-                    return std::make_unique<juce::AudioFormatWriter::ThreadedWriter> (writer, recordThread, 1 << 17);
-                }
-                return nullptr;
-            };
-
             // One mono take per musician: the raw signal, before gain/mute,
-            // so the balance can be redone in the Recordings tab.
+            // so the balance can be redone in the Recordings window.
             {
                 const juce::ScopedLock sl (streamsLock);
                 for (auto* stream : streams)
@@ -325,7 +424,7 @@ void HostMixEngine::startJamPlayback (bool recordToFile)
                     track->streamName  = stream->name;
                     track->displayName = stream->name;
                     track->fileName    = "take_" + paths::safeFileName (stream->name) + ".wav";
-                    track->writer      = makeWriter (recordingDir.getChildFile (track->fileName), 1);
+                    track->writer      = makeThreadedWriter (recordingDir.getChildFile (track->fileName), songRate, 1);
                     if (track->writer != nullptr)
                         recordTracks.add (track.release());
                 }
@@ -336,7 +435,7 @@ void HostMixEngine::startJamPlayback (bool recordToFile)
                 auto track = std::make_unique<RecordTrack>();
                 track->displayName = "My Instrument";
                 track->fileName    = "take_My Instrument.wav";
-                track->writer      = makeWriter (recordingDir.getChildFile (track->fileName), 2);
+                track->writer      = makeThreadedWriter (recordingDir.getChildFile (track->fileName), songRate, 2);
                 if (track->writer != nullptr)
                 {
                     hostRecordTrack = track.get();
@@ -654,8 +753,34 @@ void HostMixEngine::audioDeviceIOCallbackWithContext (const float* const* inputC
     if (outL == nullptr)
         return;
 
-    const float* inL = numInputChannels > 0 && inputChannelData[0] != nullptr ? inputChannelData[0] : nullptr;
-    const float* inR = numInputChannels > 1 && inputChannelData[1] != nullptr ? inputChannelData[1] : inL;
+    const float* hwL = numInputChannels > 0 && inputChannelData[0] != nullptr ? inputChannelData[0] : nullptr;
+    const float* hwR = numInputChannels > 1 && inputChannelData[1] != nullptr ? inputChannelData[1] : hwL;
+
+    // The effective host input = hardware input + VST instrument (rendered
+    // here). Everything below (recording bridge, stream feed, passthrough)
+    // sees the combined signal.
+    instrument.process (numSamples);
+
+    const float* inL = hwL;
+    const float* inR = hwR;
+    if (hostInCapacity >= numSamples && (hwL != nullptr || instrument.isLoaded()))
+    {
+        if (hwL != nullptr)
+        {
+            juce::FloatVectorOperations::copy (hostInL.getData(), hwL, numSamples);
+            juce::FloatVectorOperations::copy (hostInR.getData(), hwR, numSamples);
+        }
+        else
+        {
+            juce::FloatVectorOperations::clear (hostInL.getData(), numSamples);
+            juce::FloatVectorOperations::clear (hostInR.getData(), numSamples);
+        }
+
+        float* combined[2] = { hostInL.getData(), hostInR.getData() };
+        instrument.addToOutput (combined, 2, numSamples);
+        inL = hostInL.getData();
+        inR = hostInR.getData();
+    }
 
     auto st = state.load();
 
@@ -820,6 +945,14 @@ void HostMixEngine::audioDeviceIOCallbackWithContext (const float* const* inputC
     {
         hostInLevel.store (0.0f);
     }
+
+    // Preview recording: capture the finished local mix (what the host hears).
+    if (st == State::idle && previewRecActive.load() && previewRecWriter != nullptr)
+    {
+        const float* chans[2] = { outL, outR != nullptr ? outR : outL };
+        previewRecWriter->write (chans, numSamples);
+        previewRecSamples.fetch_add (numSamples);
+    }
 }
 
 void HostMixEngine::audioDeviceAboutToStart (juce::AudioIODevice* device)
@@ -833,6 +966,12 @@ void HostMixEngine::audioDeviceAboutToStart (juce::AudioIODevice* device)
         streamFeedL.allocate ((size_t) block, true);
         streamFeedR.allocate ((size_t) block, true);
         streamFeedCapacity = block;
+
+        hostInL.allocate ((size_t) block, true);
+        hostInR.allocate ((size_t) block, true);
+        hostInCapacity = block;
+
+        instrument.prepare (deviceRate, block);
 
         // Device (rate) changed while a jam is prepared/running: re-bridge
         // between song rate and the new device rate. Safe here - callbacks

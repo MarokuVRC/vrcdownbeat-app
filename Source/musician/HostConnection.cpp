@@ -1,5 +1,6 @@
 #include "HostConnection.h"
 #include "common/AppPaths.h"
+#include "common/Settings.h"
 #include <cstring>
 
 namespace bandjam
@@ -369,7 +370,7 @@ void HostConnection::handleMessage (const Message& msg)
             {
                 // First file of a new transfer: start a fresh ".part" folder.
                 recRecId      = recId;
-                recTempFolder = paths::recordingsRoot().getChildFile (juce::File::createLegalFileName (recId) + ".part");
+                recTempFolder = settings::recordingsFolder().getChildFile (juce::File::createLegalFileName (recId) + ".part");
                 recTempFolder.deleteRecursively();
                 recTempFolder.createDirectory();
                 recReceivedBytes = 0;
@@ -427,7 +428,7 @@ void HostConnection::handleMessage (const Message& msg)
             juce::File finalFolder;
             if (ok && recTempFolder != juce::File())
             {
-                finalFolder = paths::recordingsRoot().getChildFile (juce::File::createLegalFileName (recId));
+                finalFolder = settings::recordingsFolder().getChildFile (juce::File::createLegalFileName (recId));
                 finalFolder.deleteRecursively();
                 if (! recTempFolder.moveFileTo (finalFolder))
                 {

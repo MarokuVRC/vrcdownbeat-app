@@ -41,4 +41,34 @@ inline void set (const juce::String& key, const juce::var& value)
 inline juce::File deviceStateFile()     { return paths::appDataRoot().getChildFile ("audio_device.xml"); }
 inline juce::File hostDeviceStateFile() { return paths::appDataRoot().getChildFile ("host_audio_device.xml"); }
 
+/** Where recordings are saved and where the Recordings window looks for
+    them. Users can point this anywhere; falls back to the app-data default
+    when unset or not creatable. */
+inline juce::File recordingsFolder()
+{
+    const auto custom = get ("recordingsFolder", "").toString();
+    if (custom.isNotEmpty())
+    {
+        juce::File folder (custom);
+        if (folder.isDirectory() || folder.createDirectory())
+            return folder;
+    }
+    return paths::recordingsRoot();
+}
+
+/** Expands the user's file-name pattern for a new recording folder.
+    Tokens: {song}, {date} (YYYY-MM-DD), {time} (HH-MM-SS). */
+inline juce::String makeRecordingFolderName (const juce::String& songName)
+{
+    auto pattern = get ("recordingNamePattern", "").toString();
+    if (pattern.trim().isEmpty())
+        pattern = "{song}_{date}_{time}";
+
+    const auto now = juce::Time::getCurrentTime();
+    pattern = pattern.replace ("{song}", songName)
+                     .replace ("{date}", now.formatted ("%Y-%m-%d"))
+                     .replace ("{time}", now.formatted ("%H-%M-%S"));
+    return paths::safeFileName (pattern);
+}
+
 } // namespace bandjam::settings

@@ -12,6 +12,7 @@
 #include "ui/AudioStreamPanel.h"
 #include "ui/ChatPanel.h"
 #include "ui/RecordingsPanel.h"
+#include "ui/ChildWindow.h"
 #include <map>
 
 namespace bandjam
@@ -29,6 +30,7 @@ namespace bandjam
            -> idle      (jamStop) */
 class HostView : public juce::Component,
                  public juce::ListBoxModel,     // songs list
+                 public juce::MenuBarModel,     // "Connect" / "Settings" menus
                  private juce::Timer
 {
 public:
@@ -46,6 +48,11 @@ public:
     void paintListBoxItem (int row, juce::Graphics&, int width, int height, bool selected) override;
     void selectedRowsChanged (int) override;
 
+    // MenuBarModel
+    juce::StringArray getMenuBarNames() override;
+    juce::PopupMenu getMenuForIndex (int menuIndex, const juce::String& menuName) override;
+    void menuItemSelected (int menuItemID, int menuIndex) override;
+
 private:
     enum class Phase { idle, loading, preparing, countdown, running };
 
@@ -59,11 +66,14 @@ private:
     class MusiciansModel;
 
     void timerCallback() override;
-    void toggleServer();
-    void toggleRoom();
-    bool applyHostName();   ///< validates + stores the name; false = refused
+    void showHostServerDialog();
+    void showRoomServerDialog();
+    void startOwnServer (const juce::String& name, int port);
+    void startRoomServer (const juce::String& name);
+    bool applyHostName (const juce::String& name);   ///< validates + stores; false = refused
     void stopHosting (bool showOff = true);
     void onHostingStarted();
+    void updateConnectUi();
     void addSongClicked();
     void removeSongClicked();
     void updateStemInfo();
@@ -96,8 +106,16 @@ private:
     void layoutSessionPage();
     void layoutAudioPage();
     void layoutStreamPage();
+    void layoutPortTestPage();
     void initTalkMicControls();
     void refreshTalkMicDevices();
+    void initInstrumentControls();
+    void refreshInstrumentUi();
+    void refreshMidiInputs();
+    void loadInstrumentClicked();
+    void initRecordingControls();
+    void refreshRecordingFolderLabel();
+    void updatePreviewAutoRecord();
     void startVoice();
     void stopVoice();
     void previewLoadClicked();
@@ -127,19 +145,25 @@ private:
     bool         portTestRunning { false };
 
     // -- widgets -----------------------------------------------------------------
+    // Top bar: Connect/Settings menus (Windows style) + Change Role/Disconnect,
+    // which stay reachable no matter which tool windows are open.
+    juce::MenuBarComponent menuBar { this };
     juce::Label      headerLabel;
-    juce::TextButton leaveButton;
+    juce::TextButton leaveButton;        ///< "Change Role" - back to the mode picker
+    juce::TextButton disconnectButton;   ///< visible while hosting
 
-    juce::Label      nameCaption, portCaption, ipLabel, serverStatusLabel, portTestResultLabel;
-    juce::TextEditor nameEditor, portEditor;
-    juce::TextButton serverButton, roomButton, copyCodeButton, portTestButton, showIpsButton;
+    juce::Label      serverStatusLabel;
+    juce::TextButton copyCodeButton;
     bool relayMode { false };   ///< true while hosting via room code
     bool ipsVisible { false };  ///< IPs stay masked unless the user reveals them
 
-    // Tabs: "Session" (jam workflow + chat), "Audio" (device settings),
-    // "Audio Stream" (routing board) and "Recordings" (stem remix + MP3).
-    juce::TabbedComponent tabs { juce::TabbedButtonBar::TabsAtTop };
-    LambdaPage sessionPage, audioPage, streamPage, recordingsPage;
+    // "Test Port" tool window content.
+    juce::Label      portTestHintLabel, ipLabel, portTestResultLabel, portTestExplainLabel;
+    juce::TextButton portTestButton, showIpsButton;
+
+    // Main content is the session (jam workflow + chat). "Audio",
+    // "Audio Stream" and "Recordings" open as separate tool windows.
+    LambdaPage sessionPage, audioPage, streamPage, recordingsPage, portTestPage;
     std::unique_ptr<AudioStreamPanel> streamPanel;
     std::unique_ptr<RecordingsPanel> recordingsPanel;
     ChatPanel chatPanel;
@@ -185,6 +209,23 @@ private:
     bool talkAutoMuted { false };            ///< the auto-mute is currently engaged
     bool talkResumeVoice { false }, talkResumeStream { false };
 
+    // VST3 instrument (host side): rendered into the host input path.
+    juce::Label      instCaption, instStatusLabel, midiCaption, midiActivityLabel;
+    juce::TextButton instLoadButton, instUiButton, instRemoveButton, midiRescanButton;
+    juce::ComboBox   midiInputBox;
+    juce::Array<juce::MidiDeviceInfo> midiInputs;
+    juce::ToggleButton loadVstOnStartToggle;
+    std::unique_ptr<juce::FileChooser> instChooser;
+
+    // Recording settings: auto-record toggles + folder + file-name pattern.
+    juce::Label        recSettingsCaption, recFolderLabel, recPatternCaption, recPatternHintLabel;
+    juce::ToggleButton autoRecordPlayToggle, autoRecordJamToggle;
+    juce::TextButton   recFolderButton;
+    juce::TextEditor   recPatternEditor;
+    bool autoRecordOnPlay { false }, autoRecordOnJam { false };
+    bool previewRecFailed { false };   ///< suppresses auto-record retries this playback
+    std::unique_ptr<juce::FileChooser> recFolderChooser;
+
     juce::Label      musiciansCaption;
     std::unique_ptr<MusiciansModel> musiciansModel;
     juce::ListBox    musiciansList;
@@ -193,6 +234,9 @@ private:
     juce::TextEditor logView;
 
     std::unique_ptr<juce::FileChooser> fileChooser;
+
+    // Tool windows (declared last so they are destroyed before their content).
+    std::unique_ptr<ChildWindow> audioWindow, streamWindow, recordingsWindow, portTestWindow;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (HostView)
 };
