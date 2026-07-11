@@ -37,6 +37,13 @@ public:
 
     void selectedRowsChanged (int) override { owner.localSelectionChanged(); }
 
+    void listBoxItemDoubleClicked (int row, const juce::MouseEvent&) override
+    {
+        const auto& songs = owner.localSongs.getSongs();
+        if (juce::isPositiveAndBelow (row, songs.size()))
+            owner.showRenameLocalSongDialog (songs.getReference (row).id);
+    }
+
 private:
     MusicianView& owner;
 };
@@ -179,6 +186,14 @@ MusicianView::MusicianView()
     stemsViewport.setViewedComponent (&stemsContainer, false);
     stemsViewport.setScrollBarsShown (true, false);
     sessionPage.addAndMakeVisible (stemsViewport);
+
+    // Master over all stems: one slider to raise/lower the whole song without
+    // touching the per-stem balance. Shown only when the song has 2+ stems.
+    stemMasterStrip.setInfoText ("master");
+    stemMasterStrip.setMuteTooltip ("Mute the whole backing track");
+    stemMasterStrip.onGain = [this] (float db) { engine.setStemMasterGainDb (db); };
+    stemMasterStrip.onMute = [this] (bool m)   { engine.setStemMasterMute (m); };
+    stemsContainer.addChildComponent (stemMasterStrip);
 
     // -- jam ------------------------------------------------------------------------
     style::styleSectionLabel (jamCaption, "Jam");
@@ -481,6 +496,7 @@ MusicianView::MusicianView()
         player.getLengthSeconds   = [this] { return engine.getLengthSeconds(); };
         player.setStemGainDb = [this] (int i, float db) { engine.setStemGainDb (i, db); };
         player.setStemMute   = [this] (int i, bool m)   { engine.setStemMute (i, m); };
+        player.setStemFx     = [this] (int i, const FxSettings& fx) { engine.setStemFx (i, fx); };
         player.getStemLevel  = [this] (int i)           { return engine.getStemLevel (i); };
 
         recOptions.showAutoReceiveToggle = true;
@@ -1345,6 +1361,162 @@ void MusicianView::addLocalSongClicked()
         });
 }
 
+//==============================================================================
+// Drag & drop import: audio files become single-stem songs named after the
+// FILE, dropped folders become one song each named after the FOLDER (with all
+// audio files inside as stems). Only the local "My songs" list accepts drops -
+// the host list is managed by the host.
+static bool isDroppableAudioFile (const juce::File& f)
+{
+    return f.hasFileExtension ("wav;mp3;flac;aiff;aif;ogg");
+}
+
+bool MusicianView::isInterestedInFileDrag (const juce::StringArray& files)
+{
+    for (const auto& path : files)
+    {
+        const juce::File f (path);
+        if (f.isDirectory() || isDroppableAudioFile (f))
+            return true;
+    }
+    return false;
+}
+
+bool MusicianView::dropIsOverLocalList (int x, int y) const
+{
+    if (! localList.isShowing())
+        return false;
+    const auto p = localList.getLocalPoint (this, juce::Point<int> (x, y));
+    return localList.getLocalBounds().contains (p);
+}
+
+void MusicianView::setLocalListDragHighlight (bool on)
+{
+    if (localDragHighlight == on)
+        return;
+    localDragHighlight = on;
+    localList.setColour (juce::ListBox::outlineColourId, style::accent());
+    localList.setOutlineThickness (on ? 2 : 0);
+    localList.repaint();
+}
+
+void MusicianView::fileDragMove (const juce::StringArray& files, int x, int y)
+{
+    setLocalListDragHighlight (isInterestedInFileDrag (files) && dropIsOverLocalList (x, y));
+}
+
+void MusicianView::fileDragExit (const juce::StringArray&)
+{
+    setLocalListDragHighlight (false);
+}
+
+void MusicianView::filesDropped (const juce::StringArray& files, int x, int y)
+{
+    setLocalListDragHighlight (false);
+    if (dropIsOverLocalList (x, y))
+        importDroppedSongs (files);
+}
+
+void MusicianView::importDroppedSongs (const juce::StringArray& files)
+{
+    int added = 0;
+    juce::String lastName;
+
+    for (const auto& path : files)
+    {
+        const juce::File item (path);
+        juce::String error;
+
+        if (item.isDirectory())
+        {
+            juce::Array<juce::File> stems;
+            for (const auto& f : item.findChildFiles (juce::File::findFiles, false))
+                if (isDroppableAudioFile (f))
+                    stems.add (f);
+
+            std::sort (stems.begin(), stems.end(), [] (const juce::File& a, const juce::File& b)
+                       { return a.getFileName().compareNatural (b.getFileName()) < 0; });
+
+            if (stems.isEmpty())
+            {
+                downloadStatusLabel.setText ("\"" + item.getFileName() + "\" contains no audio files.",
+                                             juce::dontSendNotification);
+                continue;
+            }
+
+            if (localSongs.addSong (item.getFileName(), stems, error).isEmpty())
+                downloadStatusLabel.setText ("Import failed: " + error, juce::dontSendNotification);
+            else
+            {
+                ++added;
+                lastName = item.getFileName();
+            }
+        }
+        else if (isDroppableAudioFile (item))
+        {
+            juce::Array<juce::File> single;
+            single.add (item);
+            if (localSongs.addSong (item.getFileNameWithoutExtension(), single, error).isEmpty())
+                downloadStatusLabel.setText ("Import failed: " + error, juce::dontSendNotification);
+            else
+            {
+                ++added;
+                lastName = item.getFileNameWithoutExtension();
+            }
+        }
+    }
+
+    if (added == 1)
+        downloadStatusLabel.setText ("\"" + lastName + "\" added to My songs.", juce::dontSendNotification);
+    else if (added > 1)
+        downloadStatusLabel.setText (juce::String (added) + " songs added to My songs.",
+                                     juce::dontSendNotification);
+}
+
+// Double-click a song in "My songs" to edit the song name and every stem name.
+// Ids and files stay untouched, so a loaded/playing song keeps working.
+void MusicianView::showRenameLocalSongDialog (const juce::String& songId)
+{
+    const auto* song = localSongs.findSong (songId);
+    if (song == nullptr)
+        return;
+
+    auto* window = new juce::AlertWindow ("Rename song",
+                                          "Edit the song name and the stem names:",
+                                          juce::MessageBoxIconType::NoIcon);
+    window->addTextEditor ("song", song->name, "Song:");
+
+    juce::StringArray stemIds;
+    for (int i = 0; i < song->stems.size(); ++i)
+    {
+        const auto& stem = song->stems.getReference (i);
+        stemIds.add (stem.id);
+        window->addTextEditor ("stem" + juce::String (i), stem.name,
+                               "Stem " + juce::String (i + 1) + ":");
+    }
+
+    window->addButton ("OK", 1, juce::KeyPress (juce::KeyPress::returnKey));
+    window->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+
+    juce::Component::SafePointer<MusicianView> safe (this);
+    window->enterModalState (true,
+        juce::ModalCallbackFunction::create ([safe, window, songId, stemIds] (int result)
+        {
+            if (safe == nullptr || result != 1)
+                return;
+
+            const auto newName = window->getTextEditorContents ("song");
+            safe->localSongs.renameSong (songId, newName);
+            for (int i = 0; i < stemIds.size(); ++i)
+                safe->localSongs.renameStem (songId, stemIds[i],
+                                             window->getTextEditorContents ("stem" + juce::String (i)));
+
+            // Refresh the title and the stem strips if this song is loaded.
+            safe->selectedRowsChanged (0);
+        }),
+        true);
+}
+
 void MusicianView::removeLocalSongClicked()
 {
     const auto* local = selectedLocalSong();
@@ -1486,6 +1658,18 @@ void MusicianView::rebuildStemStrips()
                 if (engine.getLoadedSongId() == songId)
                     engine.setStemMute (index, mute);
             };
+            strip->getFx = [this, songId, index]() -> FxSettings
+            {
+                if (engine.getLoadedSongId() == songId)
+                    return engine.getStemFx (index);
+                return {};
+            };
+            strip->setFx = [this, songId, index] (const FxSettings& fx)
+            {
+                if (engine.getLoadedSongId() == songId)
+                    engine.setStemFx (index, fx);
+            };
+            strip->enableFx();
 
             stemsContainer.addAndMakeVisible (strip);
             stemStrips.add (strip);
@@ -1533,6 +1717,18 @@ void MusicianView::rebuildStemStrips()
             if (engine.getLoadedSongId() == songId)
                 engine.setStemMute (index, mute);
         };
+        strip->getFx = [this, songId, index]() -> FxSettings
+        {
+            if (engine.getLoadedSongId() == songId)
+                return engine.getStemFx (index);
+            return {};
+        };
+        strip->setFx = [this, songId, index] (const FxSettings& fx)
+        {
+            if (engine.getLoadedSongId() == songId)
+                engine.setStemFx (index, fx);
+        };
+        strip->enableFx();
 
         stemsContainer.addAndMakeVisible (strip);
         stemStrips.add (strip);
@@ -1544,13 +1740,26 @@ void MusicianView::rebuildStemStrips()
 
 void MusicianView::layoutStemStrips()
 {
-    const int rowHeight = 34;
-    const int width = stemsViewport.getWidth()
-                      - (stemStrips.size() * rowHeight > stemsViewport.getHeight() ? 12 : 0);
+    // The master row only makes sense with 2+ stems (and always reflects the
+    // engine, so it stays correct when the strips are rebuilt).
+    stemMasterStrip.setVisible (stemStrips.size() > 1);
+    if (stemMasterStrip.isVisible())
+        stemMasterStrip.setValues (engine.getStemMasterGainDb(), engine.getStemMasterMute());
 
-    stemsContainer.setSize (juce::jmax (0, width), juce::jmax (0, stemStrips.size() * rowHeight));
+    const int rowHeight = 34;
+    const int rows = stemStrips.size() + (stemMasterStrip.isVisible() ? 1 : 0);
+    const int width = stemsViewport.getWidth()
+                      - (rows * rowHeight > stemsViewport.getHeight() ? 12 : 0);
+
+    stemsContainer.setSize (juce::jmax (0, width), juce::jmax (0, rows * rowHeight));
 
     int y = 0;
+    if (stemMasterStrip.isVisible())
+    {
+        stemMasterStrip.setBounds (0, y, stemsContainer.getWidth(), rowHeight - 4);
+        y += rowHeight;
+    }
+
     for (auto* strip : stemStrips)
     {
         strip->setBounds (0, y, stemsContainer.getWidth(), rowHeight - 4);

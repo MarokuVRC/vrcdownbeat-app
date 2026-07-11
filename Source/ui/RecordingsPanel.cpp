@@ -243,6 +243,9 @@ std::vector<RecordingsPanel::TrackInfo> RecordingsPanel::parseTracks (const juce
             info.fileName = t.getProperty ("file", juce::String()).toString();
             info.name     = t.getProperty ("name", juce::String()).toString();
             info.kind     = t.getProperty ("kind", "stem").toString();
+            info.gainDb   = (float) (double) t.getProperty ("gainDb", 0.0);
+            info.mute     = (bool) t.getProperty ("mute", false);
+            info.fx       = FxSettings::fromVar (t.getProperty ("fx", juce::var()));
             if (info.fileName.isNotEmpty())
                 result.push_back (std::move (info));
         }
@@ -308,8 +311,25 @@ void RecordingsPanel::loadClicked()
             safe->loadedDir    = entry.dir;
             safe->loadedName   = id;
             safe->loadedTracks = std::move (tracks);
-            safe->gainsDb.assign (safe->loadedTracks.size(), 0.0f);
-            safe->mutes.assign (safe->loadedTracks.size(), 0);
+
+            // Start from the mix that was live during the jam (gains, mutes,
+            // EQ/effects come along in meta.json - the files are raw).
+            const auto count = safe->loadedTracks.size();
+            safe->gainsDb.resize (count);
+            safe->mutes.resize (count);
+            safe->fxs.resize (count);
+            for (size_t t = 0; t < count; ++t)
+            {
+                const auto& info = safe->loadedTracks[t];
+                safe->gainsDb[t] = info.gainDb;
+                safe->mutes[t]   = info.mute ? 1 : 0;
+                safe->fxs[t]     = info.fx;
+
+                safe->options.player.setStemGainDb ((int) t, info.gainDb);
+                safe->options.player.setStemMute ((int) t, info.mute);
+                if (safe->options.player.setStemFx)
+                    safe->options.player.setStemFx ((int) t, info.fx);
+            }
 
             style::styleSectionLabel (safe->loadedTitle, entry.song + "  (" + entry.date + ")");
             safe->posSlider.setRange (0.0, juce::jmax (0.1, safe->options.player.getLengthSeconds()), 0.01);
@@ -379,6 +399,14 @@ void RecordingsPanel::rebuildStrips()
             mutes[(size_t) i] = mute ? 1 : 0;
             options.player.setStemMute (i, mute);
         };
+        strip->getFx = [this, i] { return fxs[(size_t) i]; };
+        strip->setFx = [this, i] (const FxSettings& fx)
+        {
+            fxs[(size_t) i] = fx;
+            if (options.player.setStemFx)
+                options.player.setStemFx (i, fx);
+        };
+        strip->enableFx();
         stripsContainer.addAndMakeVisible (strip);
         strips.add (strip);
     }
@@ -426,6 +454,7 @@ void RecordingsPanel::exportClicked()
     // Snapshot the mix parameters now; the render must not race the sliders.
     auto gains = gainsDb;
     auto muted = mutes;
+    auto fxSnapshot = fxs;
     const int generation = ++loadGeneration;   // a new Load cancels the status updates
     juce::Component::SafePointer<RecordingsPanel> safe (this);
 
@@ -445,7 +474,7 @@ void RecordingsPanel::exportClicked()
     // Decode fresh from disk (independent of the live player buffers),
     // then mix + encode on a worker thread.
     songloader::decodeAsync (std::move (requests), exportRate,
-        [gains = std::move (gains), muted = std::move (muted),
+        [gains = std::move (gains), muted = std::move (muted), fxSnapshot = std::move (fxSnapshot),
          exportRate, bitrate, outFile, finish] (std::shared_ptr<songloader::Result> result)
     {
         if (! result->ok)
@@ -454,7 +483,7 @@ void RecordingsPanel::exportClicked()
             return;
         }
 
-        std::thread ([result, gains, muted, exportRate, bitrate, outFile, finish]
+        std::thread ([result, gains, muted, fxSnapshot, exportRate, bitrate, outFile, finish]
         {
             Mp3Writer writer;
             juce::String error;
@@ -470,6 +499,20 @@ void RecordingsPanel::exportClicked()
 
             constexpr int chunk = 4096;
             std::vector<float> inter ((size_t) chunk * 2);
+            std::vector<float> tmpL ((size_t) chunk), tmpR ((size_t) chunk);
+
+            // The stems on disk are raw: bake the panel's EQ/effects into the
+            // export the same way they are applied live.
+            std::vector<std::unique_ptr<ChannelFx>> fxUnits (result->stems.size());
+            for (size_t s = 0; s < result->stems.size(); ++s)
+            {
+                if (s < fxSnapshot.size() && fxSnapshot[s].isActive())
+                {
+                    fxUnits[s] = std::make_unique<ChannelFx>();
+                    fxUnits[s]->prepare (exportRate, chunk);
+                    fxUnits[s]->setSettings (fxSnapshot[s]);
+                }
+            }
 
             bool ok = total > 0;
             for (juce::int64 pos = 0; ok && pos < total; pos += chunk)
@@ -492,6 +535,15 @@ void RecordingsPanel::exportClicked()
 
                     const float* srcL = buf.getReadPointer (0, (int) pos);
                     const float* srcR = buf.getNumChannels() > 1 ? buf.getReadPointer (1, (int) pos) : srcL;
+
+                    if (fxUnits[s] != nullptr)
+                    {
+                        juce::FloatVectorOperations::copy (tmpL.data(), srcL, m);
+                        juce::FloatVectorOperations::copy (tmpR.data(), srcR, m);
+                        fxUnits[s]->processStereo (tmpL.data(), tmpR.data(), m);
+                        srcL = tmpL.data();
+                        srcR = tmpR.data();
+                    }
 
                     for (int j = 0; j < m; ++j)
                     {

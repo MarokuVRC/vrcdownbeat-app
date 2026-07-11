@@ -5,6 +5,7 @@
 #include "common/SongLoader.h"
 #include "common/StreamOutput.h"
 #include "common/StreamingResampler.h"
+#include "common/ChannelFx.h"
 #include "musician/InstrumentHost.h"
 #include <atomic>
 #include <functional>
@@ -52,7 +53,15 @@ public:
         musicians and plays along to what they hear, so a live passthrough is
         exactly in time with the delayed mix. */
     void  setHostInputGainDb (float db) { hostInGain.store (juce::Decibels::decibelsToGain (db)); }
+    /** Monitor mute: silences the host input in the LOCAL output only
+        (a singer who doesn't want to hear themselves). Recording and the
+        VRChat stream are unaffected. */
     void  setHostInputMute (bool mute)  { hostInMute.store (mute); }
+    /** Capture mute: keeps the host input (mic/instrument) out of the
+        recording AND the VRChat stream - the take is written as silence so
+        all files stay aligned. The local monitor is unaffected. */
+    void  setHostInputCaptureMute (bool mute) { hostCaptureMute.store (mute); }
+    bool  getHostInputCaptureMute() const noexcept { return hostCaptureMute.load(); }
     float getHostInputLevel() const noexcept { return hostInLevel.load(); }
 
     // -- VST instrument (rendered inside the callback, part of the host input) ------
@@ -164,6 +173,25 @@ public:
     void         setStemGainDb (int index, float gainDb);
     void         setStemMute (int index, bool mute);
 
+    // -- master volume over ALL backing-track stems (multiplies the per-stem
+    //    gains, so the balance between stems is kept) --------------------------------
+    void  setStemMasterGainDb (float db)    { stemMasterGain.store (juce::Decibels::decibelsToGain (db)); }
+    void  setStemMasterMute (bool mute)     { stemMasterMute.store (mute); }
+    float getStemMasterGainDb() const       { return juce::Decibels::gainToDecibels (stemMasterGain.load(), -40.0f); }
+    bool  getStemMasterMute() const         { return stemMasterMute.load(); }
+    void  setPreviewMasterGainDb (float db) { previewMasterGain.store (juce::Decibels::decibelsToGain (db)); }
+    void  setPreviewMasterMute (bool mute)  { previewMasterMute.store (mute); }
+    float getPreviewMasterGainDb() const    { return juce::Decibels::gainToDecibels (previewMasterGain.load(), -40.0f); }
+    bool  getPreviewMasterMute() const      { return previewMasterMute.load(); }
+
+    // -- per-channel EQ + effects (live only - recordings stay raw) -----------------
+    void       setStemFx (int index, const FxSettings& fx);
+    FxSettings getStemFx (int index) const;
+    void       setPreviewStemFx (int index, const FxSettings& fx);
+    FxSettings getPreviewStemFx (int index) const;
+    void       setPerformerFx (const juce::String& performerName, const FxSettings& fx);
+    FxSettings getPerformerFx (const juce::String& performerName) const;
+
     float getOutputLevel() const noexcept { return outputLevel.load(); }
 
     /** VRChat/virtual-mic stream: receives a copy of the master mix whenever
@@ -185,6 +213,7 @@ private:
         std::atomic<float> gain  { 1.0f };
         std::atomic<bool>  mute  { false };
         std::atomic<float> level { 0.0f };    ///< post-gain peak (preview player)
+        ChannelFx fx;                         ///< live EQ/reverb (the buffer stays raw)
     };
 
     /** One musician's jitter/positioning buffer (song rate, mono).
@@ -213,6 +242,7 @@ private:
         std::atomic<float> gain  { 1.0f };
         std::atomic<float> level { 0.0f };
         std::atomic<bool>  mute  { false };
+        ChannelFx fx;                            ///< live EQ/reverb (the raw take is recorded pre-fx)
 
         // Monitor (soundcheck) playback state.
         std::atomic<juce::int64> monitorReadPos { 0 };
@@ -257,9 +287,20 @@ private:
     // Host's own live input (talk mic / instrument). Muted by default so a
     // default-device mic can't feed back before the UI applies the settings.
     std::atomic<float> hostInGain  { 1.0f };
-    std::atomic<bool>  hostInMute  { true };
+    std::atomic<bool>  hostInMute  { true };    ///< monitor mute (local output only)
+    std::atomic<bool>  hostCaptureMute { false }; ///< keep out of recording + stream
     std::atomic<float> hostInLevel { 0.0f };
     bool deviceInitialised { false };
+
+    juce::HeapBlock<float> fxChunkL, fxChunkR;   ///< scratch: per-stem fx (song-time chunks)
+    juce::HeapBlock<float> fxBlockL, fxBlockR;   ///< scratch: per-stem fx (device blocks)
+    int fxBlockCapacity { 0 };
+
+    // Backing-track master (jam stems and preview player, independent).
+    std::atomic<float> stemMasterGain    { 1.0f };
+    std::atomic<bool>  stemMasterMute    { false };
+    std::atomic<float> previewMasterGain { 1.0f };
+    std::atomic<bool>  previewMasterMute { false };
 
     // Optional VST3 instrument: rendered in the callback and added to the
     // hardware input - together they form the "host input" that feeds the

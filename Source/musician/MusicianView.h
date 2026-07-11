@@ -24,6 +24,7 @@ namespace bandjam
 class MusicianView : public juce::Component,
                      public juce::ListBoxModel,   // songs list
                      public juce::MenuBarModel,   // "Connect" / "Settings" menus
+                     public juce::FileDragAndDropTarget,   // drop audio files/folders on "My songs"
                      private juce::Timer
 {
 public:
@@ -76,8 +77,18 @@ private:
     void localSelectionChanged();
     void addLocalSongClicked();
     void removeLocalSongClicked();
+    void showRenameLocalSongDialog (const juce::String& songId);   // double-click on "My songs"
     void sendLocalSongClicked();
     const LibrarySong* selectedLocalSong() const;
+
+    // Drag & drop import (audio files / stem folders onto "My songs").
+    bool isInterestedInFileDrag (const juce::StringArray& files) override;
+    void fileDragMove (const juce::StringArray& files, int x, int y) override;
+    void fileDragExit (const juce::StringArray& files) override;
+    void filesDropped (const juce::StringArray& files, int x, int y) override;
+    bool dropIsOverLocalList (int x, int y) const;
+    void setLocalListDragHighlight (bool on);
+    void importDroppedSongs (const juce::StringArray& files);
 
     void handleJamPrepare (const juce::var& json);
     void continueJamPreparation();
@@ -152,6 +163,7 @@ private:
     std::unique_ptr<LocalSongsModel> localModel;
     juce::ListBox    localList { "localsongs", nullptr };
     juce::TextButton localAddButton, localRemoveButton, localSendButton;
+    bool             localDragHighlight { false };
     std::unique_ptr<juce::FileChooser> songChooser;
     bool syncingSelection { false };   ///< guards the two lists' mutual deselect
     bool songUploadActive { false };
@@ -163,6 +175,9 @@ private:
     juce::Component  stemsContainer;
     juce::OwnedArray<ChannelStrip> stemStrips;
     juce::Array<juce::String>      stemStripIds;
+
+    // Master over all stems (shown when a song has 2+ stems).
+    ChannelStrip     stemMasterStrip { "All stems" };
 
     juce::Label      jamCaption, jamStatusLabel, countdownLabel;
     juce::Label      backingMeterCaption, micMeterCaption;

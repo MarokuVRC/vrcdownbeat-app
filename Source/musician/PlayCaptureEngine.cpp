@@ -96,6 +96,8 @@ bool PlayCaptureEngine::adoptSong (const LocalSong& meta, std::vector<songloader
         stem->gain.store (juce::Decibels::decibelsToGain (d.gainDb));
         stem->mute.store (d.mute);
         stem->buffer = std::move (d.buffer);
+        stem->fx.prepare (deviceRate > 0.0 ? deviceRate : 44100.0,
+                          juce::jmax (2048, fxCapacity));
         maxLen = juce::jmax (maxLen, (juce::int64) stem->buffer.getNumSamples());
         newStems.add (stem);
     }
@@ -149,6 +151,19 @@ float PlayCaptureEngine::getStemLevel (int index) const
     if (juce::isPositiveAndBelow (index, stems.size()))
         return stems.getUnchecked (index)->level.load();
     return 0.0f;
+}
+
+void PlayCaptureEngine::setStemFx (int index, const FxSettings& fx)
+{
+    if (juce::isPositiveAndBelow (index, stems.size()))
+        stems.getUnchecked (index)->fx.setSettings (fx);
+}
+
+FxSettings PlayCaptureEngine::getStemFx (int index) const
+{
+    if (juce::isPositiveAndBelow (index, stems.size()))
+        return stems.getUnchecked (index)->fx.getSettings();
+    return {};
 }
 
 //==============================================================================
@@ -342,26 +357,41 @@ void PlayCaptureEngine::renderStems (juce::int64 position, float* const* out, in
 
     float peak = 0.0f;
 
+    const bool  masterMuted = stemMasterMute.load();
+    const float masterGain  = stemMasterGain.load();
     for (auto* stem : stems)
     {
         const auto& buf = stem->buffer;
         const auto  len = (juce::int64) buf.getNumSamples();
 
-        if (stem->mute.load() || position >= len)
+        if (stem->mute.load() || masterMuted || position >= len)
         {
             stem->level.store (0.0f);
             continue;
         }
 
         const int n = (int) juce::jmin ((juce::int64) numSamples, len - position);
-        const float gain = stem->gain.load();
+        const float gain = stem->gain.load() * masterGain;
 
         const float* left  = buf.getReadPointer (0, (int) position);
         const float* right = buf.getNumChannels() > 1 ? buf.getReadPointer (1, (int) position) : left;
 
-        juce::FloatVectorOperations::addWithMultiply (out[0], left, gain, n);
-        if (numOut > 1)
-            juce::FloatVectorOperations::addWithMultiply (out[1], right, gain, n);
+        if (stem->fx.isBypassed() || fxCapacity < n)
+        {
+            juce::FloatVectorOperations::addWithMultiply (out[0], left, gain, n);
+            if (numOut > 1)
+                juce::FloatVectorOperations::addWithMultiply (out[1], right, gain, n);
+        }
+        else
+        {
+            // Live EQ/reverb on a copy - the RAM buffer stays raw.
+            juce::FloatVectorOperations::copy (fxL.getData(), left, n);
+            juce::FloatVectorOperations::copy (fxR.getData(), right, n);
+            stem->fx.processStereo (fxL.getData(), fxR.getData(), n);
+            juce::FloatVectorOperations::addWithMultiply (out[0], fxL.getData(), gain, n);
+            if (numOut > 1)
+                juce::FloatVectorOperations::addWithMultiply (out[1], fxR.getData(), gain, n);
+        }
 
         const auto range = juce::FloatVectorOperations::findMinAndMax (left, n);
         stem->level.store (juce::jmax (std::abs (range.getStart()), std::abs (range.getEnd())) * gain);
@@ -528,6 +558,9 @@ void PlayCaptureEngine::audioDeviceAboutToStart (juce::AudioIODevice* device)
     streamL.allocate ((size_t) block, true);
     streamR.allocate ((size_t) block, true);
     instMonoCapacity = block;
+    fxL.allocate ((size_t) block, true);
+    fxR.allocate ((size_t) block, true);
+    fxCapacity = block;
 
     streamOut.setSourceRate (deviceRate);
 }

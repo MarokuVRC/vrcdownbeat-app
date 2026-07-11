@@ -292,7 +292,29 @@ HostView::HostView()
         engine.setHostInputMute (mute);
         settings::set ("hostInputMute", mute);
     };
+    hostInputStrip.setMuteTooltip ("Monitor: mute your own input in YOUR output only "
+                                   "(recording and stream are not affected)");
+    // Capture mute ("MIC"): keeps the host's mic/instrument out of recordings
+    // and the VRChat stream - a singer can still monitor themselves.
+    {
+        const bool savedCaptureMute = (bool) settings::get ("hostInputCaptureMute", false);
+        engine.setHostInputCaptureMute (savedCaptureMute);
+        hostInputStrip.enableCaptureMute (savedCaptureMute,
+            "Keep my input out of recordings and the VRChat stream");
+    }
+    hostInputStrip.onCaptureMute = [this] (bool mute)
+    {
+        engine.setHostInputCaptureMute (mute);
+        settings::set ("hostInputCaptureMute", mute);
+    };
     mixerContainer.addAndMakeVisible (hostInputStrip);   // permanent first row of the mix
+
+    // Master over all backing-track stems: one slider to raise/lower the whole
+    // song without touching the per-stem balance. Wired to the preview or the
+    // jam in rebuildMixerStrips(), shown only when the song has 2+ stems.
+    stemMasterStrip.setInfoText ("master");
+    stemMasterStrip.setMuteTooltip ("Mute the whole backing track");
+    mixerContainer.addChildComponent (stemMasterStrip);
 
     // -- Audio tab: talk mic (second input, separate from the interface input) -------
     initTalkMicControls();
@@ -400,6 +422,7 @@ HostView::HostView()
         player.getLengthSeconds   = [this] { return engine.getPreviewLengthSeconds(); };
         player.setStemGainDb = [this] (int i, float db) { engine.setPreviewStemGainDb (i, db); };
         player.setStemMute   = [this] (int i, bool m)   { engine.setPreviewStemMute (i, m); };
+        player.setStemFx     = [this] (int i, const FxSettings& fx) { engine.setPreviewStemFx (i, fx); };
         player.getStemLevel  = [this] (int i)           { return engine.getPreviewStemLevel (i); };
 
         recOptions.onSendRecording = [this] (const juce::File& folder, const juce::String& song,
@@ -1669,6 +1692,158 @@ void HostView::addSongClicked()
         });
 }
 
+//==============================================================================
+// Drag & drop import: audio files become single-stem songs named after the
+// FILE, dropped folders become one song each named after the FOLDER (with all
+// audio files inside as stems).
+static bool isDroppableAudioFile (const juce::File& f)
+{
+    return f.hasFileExtension ("wav;mp3;flac;aiff;aif;ogg");
+}
+
+bool HostView::isInterestedInFileDrag (const juce::StringArray& files)
+{
+    for (const auto& path : files)
+    {
+        const juce::File f (path);
+        if (f.isDirectory() || isDroppableAudioFile (f))
+            return true;
+    }
+    return false;
+}
+
+bool HostView::dropIsOverSongList (int x, int y) const
+{
+    if (! songsList.isShowing())
+        return false;
+    const auto p = songsList.getLocalPoint (this, juce::Point<int> (x, y));
+    return songsList.getLocalBounds().contains (p);
+}
+
+void HostView::setSongListDragHighlight (bool on)
+{
+    if (songDragHighlight == on)
+        return;
+    songDragHighlight = on;
+    songsList.setColour (juce::ListBox::outlineColourId, style::accent());
+    songsList.setOutlineThickness (on ? 2 : 0);
+    songsList.repaint();
+}
+
+void HostView::fileDragMove (const juce::StringArray& files, int x, int y)
+{
+    setSongListDragHighlight (isInterestedInFileDrag (files) && dropIsOverSongList (x, y));
+}
+
+void HostView::fileDragExit (const juce::StringArray&)
+{
+    setSongListDragHighlight (false);
+}
+
+void HostView::filesDropped (const juce::StringArray& files, int x, int y)
+{
+    setSongListDragHighlight (false);
+    if (dropIsOverSongList (x, y))
+        importDroppedSongs (files);
+}
+
+void HostView::importDroppedSongs (const juce::StringArray& files)
+{
+    int added = 0;
+
+    for (const auto& path : files)
+    {
+        const juce::File item (path);
+        juce::String error;
+
+        if (item.isDirectory())
+        {
+            juce::Array<juce::File> stems;
+            for (const auto& f : item.findChildFiles (juce::File::findFiles, false))
+                if (isDroppableAudioFile (f))
+                    stems.add (f);
+
+            std::sort (stems.begin(), stems.end(), [] (const juce::File& a, const juce::File& b)
+                       { return a.getFileName().compareNatural (b.getFileName()) < 0; });
+
+            if (stems.isEmpty())
+            {
+                appendLog ("Import skipped: \"" + item.getFileName() + "\" contains no audio files.");
+                continue;
+            }
+
+            if (library.addSong (item.getFileName(), stems, error).isEmpty())
+                appendLog ("Import of \"" + item.getFileName() + "\" failed: " + error);
+            else
+                ++added;
+        }
+        else if (isDroppableAudioFile (item))
+        {
+            juce::Array<juce::File> single;
+            single.add (item);
+            if (library.addSong (item.getFileNameWithoutExtension(), single, error).isEmpty())
+                appendLog ("Import of \"" + item.getFileName() + "\" failed: " + error);
+            else
+                ++added;
+        }
+    }
+
+    if (added > 0)
+        appendLog (juce::String (added) + (added == 1 ? " song" : " songs") + " added by drag & drop.");
+}
+
+//==============================================================================
+// Rename: double-click a song in the library to edit the song name and every
+// stem name. Ids and files stay untouched, so musicians keep their downloads
+// and mix settings; the changed list is broadcast automatically (onChanged).
+void HostView::listBoxItemDoubleClicked (int row, const juce::MouseEvent&)
+{
+    const auto& songs = library.getSongs();
+    if (juce::isPositiveAndBelow (row, songs.size()))
+        showRenameSongDialog (songs.getReference (row).id);
+}
+
+void HostView::showRenameSongDialog (const juce::String& songId)
+{
+    const auto* song = library.findSong (songId);
+    if (song == nullptr)
+        return;
+
+    auto* window = new juce::AlertWindow ("Rename song",
+                                          "Edit the song name and the stem names:",
+                                          juce::MessageBoxIconType::NoIcon);
+    window->addTextEditor ("song", song->name, "Song:");
+
+    juce::StringArray stemIds;
+    for (int i = 0; i < song->stems.size(); ++i)
+    {
+        const auto& stem = song->stems.getReference (i);
+        stemIds.add (stem.id);
+        window->addTextEditor ("stem" + juce::String (i), stem.name,
+                               "Stem " + juce::String (i + 1) + ":");
+    }
+
+    window->addButton ("OK", 1, juce::KeyPress (juce::KeyPress::returnKey));
+    window->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+
+    juce::Component::SafePointer<HostView> safe (this);
+    window->enterModalState (true,
+        juce::ModalCallbackFunction::create ([safe, window, songId, stemIds] (int result)
+        {
+            if (safe == nullptr || result != 1)
+                return;
+
+            const auto newName = window->getTextEditorContents ("song");
+            safe->library.renameSong (songId, newName);
+            for (int i = 0; i < stemIds.size(); ++i)
+                safe->library.renameStem (songId, stemIds[i],
+                                          window->getTextEditorContents ("stem" + juce::String (i)));
+
+            safe->appendLog ("Song renamed: " + newName.trim());
+        }),
+        true);
+}
+
 void HostView::removeSongClicked()
 {
     const int row = songsList.getSelectedRow();
@@ -1991,6 +2166,7 @@ void HostView::stopJam (const juce::String& reason, bool broadcast)
     stemStrips.clear();
     performerStrips.clear();
     performerStripNames.clear();
+    stemMasterStrip.setVisible (false);
     layoutMixerStrips();
     masterMeter.setLevel (0.0f);
 
@@ -2034,11 +2210,19 @@ void HostView::rebuildMixerStrips()
     // Outside a jam the mixer belongs to the preview player.
     if (phase == Phase::idle && engine.isPreviewLoaded())
     {
+        stemMasterStrip.setVisible (engine.getNumPreviewStems() > 1);
+        stemMasterStrip.setValues (engine.getPreviewMasterGainDb(), engine.getPreviewMasterMute());
+        stemMasterStrip.onGain = [this] (float db) { engine.setPreviewMasterGainDb (db); };
+        stemMasterStrip.onMute = [this] (bool m)   { engine.setPreviewMasterMute (m); };
+
         for (int i = 0; i < engine.getNumPreviewStems(); ++i)
         {
             auto* strip = new ChannelStrip ("Stem: " + engine.getPreviewStemName (i));
             strip->onGain = [this, i] (float db)  { engine.setPreviewStemGainDb (i, db); };
             strip->onMute = [this, i] (bool mute) { engine.setPreviewStemMute (i, mute); };
+            strip->getFx  = [this, i] { return engine.getPreviewStemFx (i); };
+            strip->setFx  = [this, i] (const FxSettings& fx) { engine.setPreviewStemFx (i, fx); };
+            strip->enableFx();
             mixerContainer.addAndMakeVisible (strip);
             stemStrips.add (strip);
         }
@@ -2047,11 +2231,19 @@ void HostView::rebuildMixerStrips()
         return;
     }
 
+    stemMasterStrip.setVisible (engine.getNumStems() > 1);
+    stemMasterStrip.setValues (engine.getStemMasterGainDb(), engine.getStemMasterMute());
+    stemMasterStrip.onGain = [this] (float db) { engine.setStemMasterGainDb (db); };
+    stemMasterStrip.onMute = [this] (bool m)   { engine.setStemMasterMute (m); };
+
     for (int i = 0; i < engine.getNumStems(); ++i)
     {
         auto* strip = new ChannelStrip ("Stem: " + engine.getStemName (i));
         strip->onGain = [this, i] (float db)  { engine.setStemGainDb (i, db); };
         strip->onMute = [this, i] (bool mute) { engine.setStemMute (i, mute); };
+        strip->getFx  = [this, i] { return engine.getStemFx (i); };
+        strip->setFx  = [this, i] (const FxSettings& fx) { engine.setStemFx (i, fx); };
+        strip->enableFx();
         mixerContainer.addAndMakeVisible (strip);
         stemStrips.add (strip);
     }
@@ -2061,6 +2253,9 @@ void HostView::rebuildMixerStrips()
         auto* strip = new ChannelStrip ("Musician: " + name);
         strip->onGain = [this, name] (float db)  { engine.setPerformerGainDb (name, db); };
         strip->onMute = [this, name] (bool mute) { engine.setPerformerMute (name, mute); };
+        strip->getFx  = [this, name] { return engine.getPerformerFx (name); };
+        strip->setFx  = [this, name] (const FxSettings& fx) { engine.setPerformerFx (name, fx); };
+        strip->enableFx();
         mixerContainer.addAndMakeVisible (strip);
         performerStrips.add (strip);
         performerStripNames.add (name);
@@ -2072,7 +2267,8 @@ void HostView::rebuildMixerStrips()
 void HostView::layoutMixerStrips()
 {
     const int rowHeight = 34;
-    const int total = 1 + stemStrips.size() + performerStrips.size();   // +1: "My Instrument"
+    const int total = 1 + (stemMasterStrip.isVisible() ? 1 : 0)
+                        + stemStrips.size() + performerStrips.size();   // +1: "My Instrument"
     const int width = mixerViewport.getWidth() - (total * rowHeight > mixerViewport.getHeight() ? 12 : 0);
 
     mixerContainer.setSize (juce::jmax (0, width), juce::jmax (0, total * rowHeight));
@@ -2080,6 +2276,12 @@ void HostView::layoutMixerStrips()
     int y = 0;
     hostInputStrip.setBounds (0, y, mixerContainer.getWidth(), rowHeight - 4);
     y += rowHeight;
+
+    if (stemMasterStrip.isVisible())
+    {
+        stemMasterStrip.setBounds (0, y, mixerContainer.getWidth(), rowHeight - 4);
+        y += rowHeight;
+    }
 
     for (auto* strip : stemStrips)
     {

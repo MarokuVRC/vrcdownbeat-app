@@ -45,6 +45,7 @@ public:
 
         std::function<void (int index, float gainDb)> setStemGainDb;
         std::function<void (int index, bool mute)>    setStemMute;
+        std::function<void (int index, const FxSettings& fx)> setStemFx;
         std::function<float (int index)>              getStemLevel;
     };
 
@@ -91,6 +92,9 @@ private:
     struct TrackInfo
     {
         juce::String fileName, name, kind;   ///< kind: "stem" | "musician" | "host"
+        float      gainDb { 0.0f };          ///< mix settings from the jam (meta.json)
+        bool       mute { false };
+        FxSettings fx;
     };
 
     // ListBoxModel
@@ -120,6 +124,7 @@ private:
     std::vector<TrackInfo> loadedTracks;
     std::vector<float> gainsDb;
     std::vector<char>  mutes;          // vector<bool> has no data(); char is fine
+    std::vector<FxSettings> fxs;       // live EQ/effects per track (non-destructive)
     int  loadGeneration { 0 };
     bool exporting { false };
 

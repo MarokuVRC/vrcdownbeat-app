@@ -31,6 +31,7 @@ namespace bandjam
 class HostView : public juce::Component,
                  public juce::ListBoxModel,     // songs list
                  public juce::MenuBarModel,     // "Connect" / "Settings" menus
+                 public juce::FileDragAndDropTarget,   // drop audio files/folders on the song list
                  private juce::Timer
 {
 public:
@@ -47,6 +48,8 @@ public:
     int  getNumRows() override;
     void paintListBoxItem (int row, juce::Graphics&, int width, int height, bool selected) override;
     void selectedRowsChanged (int) override;
+    void listBoxItemDoubleClicked (int row, const juce::MouseEvent&) override;   // rename song + stems
+    void showRenameSongDialog (const juce::String& songId);
 
     // MenuBarModel
     juce::StringArray getMenuBarNames() override;
@@ -78,6 +81,15 @@ private:
     void removeSongClicked();
     void updateStemInfo();
     void updateJamButtons();
+
+    // Drag & drop import (audio files / stem folders onto the song list).
+    bool isInterestedInFileDrag (const juce::StringArray& files) override;
+    void fileDragMove (const juce::StringArray& files, int x, int y) override;
+    void fileDragExit (const juce::StringArray& files) override;
+    void filesDropped (const juce::StringArray& files, int x, int y) override;
+    bool dropIsOverSongList (int x, int y) const;
+    void setSongListDragHighlight (bool on);
+    void importDroppedSongs (const juce::StringArray& files);
 
     void prepareJamClicked();
     void startJamClicked();
@@ -172,6 +184,7 @@ private:
     juce::ListBox    songsList { "songs", this };
     juce::TextButton addSongButton, removeSongButton;
     juce::Label      stemInfoLabel;
+    bool             songDragHighlight { false };
 
     juce::Label      jamCaption, jamStatusLabel, countdownLabel;
     juce::TextButton prepareJamButton, startJamButton, stopJamButton;
@@ -196,6 +209,9 @@ private:
 
     // The host's own live input, shown as a permanent strip in the mix list.
     ChannelStrip     hostInputStrip { "My Instrument" };
+
+    // Master over all backing-track stems (shown when a song has 2+ stems).
+    ChannelStrip     stemMasterStrip { "All stems" };
 
     // Second input: the talk-only mic (feeds the VRChat stream / voice chat,
     // never the band mix).

@@ -126,6 +126,7 @@ bool HostMixEngine::adoptPreview (const juce::String& previewNameToUse,
         stem->buffer = std::move (d.buffer);
         stem->gain.store (juce::Decibels::decibelsToGain (d.gainDb));
         stem->mute.store (d.mute);
+        stem->fx.prepare (deviceRate, juce::jmax (2048, fxBlockCapacity));
         maxLen = juce::jmax (maxLen, (juce::int64) stem->buffer.getNumSamples());
         previewStems.add (stem);
     }
@@ -179,6 +180,46 @@ float HostMixEngine::getPreviewStemLevel (int index) const
     if (juce::isPositiveAndBelow (index, previewStems.size()))
         return previewStems.getUnchecked (index)->level.load();
     return 0.0f;
+}
+
+//==============================================================================
+void HostMixEngine::setStemFx (int index, const FxSettings& fx)
+{
+    if (juce::isPositiveAndBelow (index, stems.size()))
+        stems.getUnchecked (index)->fx.setSettings (fx);
+}
+
+FxSettings HostMixEngine::getStemFx (int index) const
+{
+    if (juce::isPositiveAndBelow (index, stems.size()))
+        return stems.getUnchecked (index)->fx.getSettings();
+    return {};
+}
+
+void HostMixEngine::setPreviewStemFx (int index, const FxSettings& fx)
+{
+    if (juce::isPositiveAndBelow (index, previewStems.size()))
+        previewStems.getUnchecked (index)->fx.setSettings (fx);
+}
+
+FxSettings HostMixEngine::getPreviewStemFx (int index) const
+{
+    if (juce::isPositiveAndBelow (index, previewStems.size()))
+        return previewStems.getUnchecked (index)->fx.getSettings();
+    return {};
+}
+
+void HostMixEngine::setPerformerFx (const juce::String& performerName, const FxSettings& fx)
+{
+    if (auto* stream = findStream (performerName))
+        stream->fx.setSettings (fx);
+}
+
+FxSettings HostMixEngine::getPerformerFx (const juce::String& performerName) const
+{
+    if (auto* stream = findStream (performerName))
+        return stream->fx.getSettings();
+    return {};
 }
 
 void HostMixEngine::previewSeekSeconds (double seconds)
@@ -333,6 +374,7 @@ bool HostMixEngine::prepareMonitor (const LibrarySong& song, std::vector<songloa
         auto* stem = new RamStem();
         stem->name   = d.name;
         stem->buffer = std::move (d.buffer);
+        stem->fx.prepare (songRate, kChunk);
         maxLen = juce::jmax (maxLen, (juce::int64) stem->buffer.getNumSamples());
         stems.add (stem);
     }
@@ -343,7 +385,11 @@ bool HostMixEngine::prepareMonitor (const LibrarySong& song, std::vector<songloa
         const juce::ScopedLock sl (streamsLock);
         const int capacity = juce::nextPowerOfTwo ((int) (songRate * 30.0));
         for (const auto& name : performerNames)
-            streams.add (new PerformerStream (name, capacity));
+        {
+            auto* stream = new PerformerStream (name, capacity);
+            stream->fx.prepare (songRate, kChunk, 1);   // performer streams are mono
+            streams.add (stream);
+        }
     }
 
     // -- audio device: the host's own selection, kept open persistently ----------
@@ -386,6 +432,8 @@ bool HostMixEngine::prepareMonitor (const LibrarySong& song, std::vector<songloa
     hostRecR.allocate (kChunk, true);
     recMixL.allocate (kChunk, true);
     recMixR.allocate (kChunk, true);
+    fxChunkL.allocate (kChunk, true);
+    fxChunkR.allocate (kChunk, true);
 
     playPos.store (0);
     outputLevel.store (0.0f);
@@ -430,11 +478,21 @@ void HostMixEngine::startJamPlayback (bool recordToFile)
                 }
             }
 
-            // The host's own input (stereo, also raw).
+            // The host's own input (stereo, also raw). Label it with the name
+            // the host uses in the session, so musicians who receive the
+            // recording see whose take it is instead of "My Instrument".
             {
+                auto hostLabel = settings::get ("hostName", "").toString().trim();
+                if (hostLabel.isEmpty())
+                    hostLabel = "My Instrument";
+
+                auto file = recordingDir.getChildFile ("take_" + paths::safeFileName (hostLabel) + ".wav");
+                if (file.exists())   // a musician take already uses this name
+                    file = recordingDir.getChildFile ("take_" + paths::safeFileName (hostLabel) + "_host.wav");
+
                 auto track = std::make_unique<RecordTrack>();
-                track->displayName = "My Instrument";
-                track->fileName    = "take_My Instrument.wav";
+                track->displayName = hostLabel;
+                track->fileName    = file.getFileName();
                 track->writer      = makeThreadedWriter (recordingDir.getChildFile (track->fileName), songRate, 2);
                 if (track->writer != nullptr)
                 {
@@ -484,7 +542,10 @@ void HostMixEngine::stopAndClose()
     const bool hadRecording = recordingActive.load() && recordingDir.isDirectory();
     recordingActive.store (false);
 
-    // Collect the take metadata before the writers are destroyed.
+    // Collect the take metadata before the writers are destroyed. The jam's
+    // live mix settings (gain/mute/EQ/effects) ride along, so loading the
+    // recording starts from exactly the mix that was heard during the jam -
+    // the audio in the files stays raw.
     juce::Array<juce::var> trackMeta;
     for (auto* track : recordTracks)
     {
@@ -492,6 +553,24 @@ void HostMixEngine::stopAndClose()
         obj->setProperty ("file", track->fileName);
         obj->setProperty ("name", track->displayName);
         obj->setProperty ("kind", track->streamName.isEmpty() ? "host" : "musician");
+
+        if (track->streamName.isNotEmpty())
+        {
+            if (auto* stream = findStream (track->streamName))
+            {
+                obj->setProperty ("gainDb", juce::Decibels::gainToDecibels (stream->gain.load(), -40.0f));
+                obj->setProperty ("mute", stream->mute.load());
+                obj->setProperty ("fx", stream->fx.getSettings().toVar());
+            }
+        }
+        else
+        {
+            // The host take starts muted in the recordings mixer if the host
+            // had it muted (monitor or capture) during the jam - the raw
+            // audio is still in the file and can be unmuted any time.
+            obj->setProperty ("gainDb", juce::Decibels::gainToDecibels (hostInGain.load(), -40.0f));
+            obj->setProperty ("mute", hostInMute.load() || hostCaptureMute.load());
+        }
         trackMeta.add (juce::var (obj));
     }
     hostRecordTrack = nullptr;
@@ -501,10 +580,23 @@ void HostMixEngine::stopAndClose()
     // The backing stems sit unchanged in RAM, so instead of recording them
     // live they are written out now, trimmed to the recorded length. Move
     // the buffers into a worker so a long song never blocks the UI.
-    std::vector<std::pair<juce::String, juce::AudioBuffer<float>>> stemData;
+    struct StemOut
+    {
+        juce::String name;
+        juce::AudioBuffer<float> buffer;
+        float gainDb { 0.0f };
+        bool mute { false };
+        juce::var fx;
+    };
+    std::vector<StemOut> stemData;
     if (hadRecording)
         for (auto* stem : stems)
-            stemData.emplace_back (stem->name, std::move (stem->buffer));
+            stemData.push_back ({ stem->name, std::move (stem->buffer),
+                                  // Bake the master into the saved per-stem gain, so the
+                                  // recording opens with the exact mix that was heard.
+                                  juce::Decibels::gainToDecibels (
+                                      stem->gain.load() * stemMasterGain.load(), -40.0f),
+                                  stem->mute.load(), stem->fx.getSettings().toVar() });
 
     {
         // Reader threads may be inside push*Audio() right now.
@@ -525,10 +617,11 @@ void HostMixEngine::stopAndClose()
             juce::WavAudioFormat wav;
             int insertAt = 0;
             int index = 0;
-            for (auto& [name, buffer] : data)
+            for (auto& stemOut : data)
             {
+                auto& buffer = stemOut.buffer;
                 const auto fileName = "stem_" + juce::String (++index).paddedLeft ('0', 2)
-                                        + "_" + paths::safeFileName (name) + ".wav";
+                                        + "_" + paths::safeFileName (stemOut.name) + ".wav";
                 auto file = dir.getChildFile (fileName);
                 file.deleteFile();
 
@@ -547,8 +640,11 @@ void HostMixEngine::stopAndClose()
 
                     auto* obj = new juce::DynamicObject();
                     obj->setProperty ("file", fileName);
-                    obj->setProperty ("name", name);
+                    obj->setProperty ("name", stemOut.name);
                     obj->setProperty ("kind", "stem");
+                    obj->setProperty ("gainDb", stemOut.gainDb);
+                    obj->setProperty ("mute", stemOut.mute);
+                    obj->setProperty ("fx", stemOut.fx);
                     tracks.insert (insertAt++, juce::var (obj));   // stems first, in song order
                 }
             }
@@ -645,6 +741,9 @@ void HostMixEngine::renderMonitorChunk (float* left, float* right, int numSample
         if (stream->mute.load())
             continue;
 
+        if (! stream->fx.isBypassed())
+            stream->fx.processMono (streamScratch.getData(), numSamples);
+
         const float gain = stream->gain.load();
         juce::FloatVectorOperations::addWithMultiply (left,  streamScratch.getData(), gain, numSamples);
         juce::FloatVectorOperations::addWithMultiply (right, streamScratch.getData(), gain, numSamples);
@@ -664,9 +763,11 @@ void HostMixEngine::renderSongChunk (float* left, float* right, int numSamples)
     const auto pos = playPos.load();
 
     // Backing track ------------------------------------------------------------
+    const bool  songMasterMuted = stemMasterMute.load();
+    const float songMasterGain  = stemMasterGain.load();
     for (auto* stem : stems)
     {
-        if (stem->mute.load())
+        if (stem->mute.load() || songMasterMuted)
             continue;
 
         const auto& buf = stem->buffer;
@@ -675,13 +776,26 @@ void HostMixEngine::renderSongChunk (float* left, float* right, int numSamples)
             continue;
 
         const int n = (int) juce::jmin ((juce::int64) numSamples, len - pos);
-        const float gain = stem->gain.load();
+        const float gain = stem->gain.load() * songMasterGain;
 
         const float* srcL = buf.getReadPointer (0, (int) pos);
         const float* srcR = buf.getNumChannels() > 1 ? buf.getReadPointer (1, (int) pos) : srcL;
 
-        juce::FloatVectorOperations::addWithMultiply (left,  srcL, gain, n);
-        juce::FloatVectorOperations::addWithMultiply (right, srcR, gain, n);
+        if (stem->fx.isBypassed())
+        {
+            juce::FloatVectorOperations::addWithMultiply (left,  srcL, gain, n);
+            juce::FloatVectorOperations::addWithMultiply (right, srcR, gain, n);
+        }
+        else
+        {
+            // Live EQ/reverb on a copy - the RAM buffer (and thus the
+            // recorded stem file) stays raw.
+            juce::FloatVectorOperations::copy (fxChunkL.getData(), srcL, n);
+            juce::FloatVectorOperations::copy (fxChunkR.getData(), srcR, n);
+            stem->fx.processStereo (fxChunkL.getData(), fxChunkR.getData(), n);
+            juce::FloatVectorOperations::addWithMultiply (left,  fxChunkL.getData(), gain, n);
+            juce::FloatVectorOperations::addWithMultiply (right, fxChunkR.getData(), gain, n);
+        }
     }
 
     // Musicians ------------------------------------------------------------------
@@ -691,7 +805,7 @@ void HostMixEngine::renderSongChunk (float* left, float* right, int numSamples)
         // Always consume (cells must be cleared), even while muted.
         stream->consume (pos, streamScratch.getData(), numSamples);
 
-        // Record the raw (pre-gain/mute) take.
+        // Record the raw (pre-gain/mute/fx) take.
         if (recording)
             if (auto* track = findRecordTrack (stream->name))
             {
@@ -701,6 +815,9 @@ void HostMixEngine::renderSongChunk (float* left, float* right, int numSamples)
 
         if (stream->mute.load())
             continue;
+
+        if (! stream->fx.isBypassed())
+            stream->fx.processMono (streamScratch.getData(), numSamples);
 
         const float gain = stream->gain.load();
         juce::FloatVectorOperations::addWithMultiply (left,  streamScratch.getData(), gain, numSamples);
@@ -809,11 +926,21 @@ void HostMixEngine::audioDeviceIOCallbackWithContext (const float* const* inputC
     if (st == State::monitor || st == State::playing)
     {
         // Feed the host input into the recording bridge before rendering, so
-        // renderSongChunk() can mix this block's input into the WAV.
+        // renderSongChunk() can mix this block's input into the WAV. With
+        // capture mute engaged the take receives silence (stays aligned).
         if (st == State::playing && recordingActive.load() && inL != nullptr)
         {
-            hostRecResamplerL.pushInput (inL, numSamples);
-            hostRecResamplerR.pushInput (inR, numSamples);
+            if (hostCaptureMute.load() && fxBlockCapacity >= numSamples)
+            {
+                juce::FloatVectorOperations::clear (fxBlockL.getData(), numSamples);
+                hostRecResamplerL.pushInput (fxBlockL.getData(), numSamples);
+                hostRecResamplerR.pushInput (fxBlockL.getData(), numSamples);
+            }
+            else
+            {
+                hostRecResamplerL.pushInput (inL, numSamples);
+                hostRecResamplerR.pushInput (inR, numSamples);
+            }
         }
 
         if (outResamplerL.isPassThrough())
@@ -857,26 +984,40 @@ void HostMixEngine::audioDeviceIOCallbackWithContext (const float* const* inputC
         const auto pos = previewPos.load();
         float peak = 0.0f;
 
+        const bool  prevMasterMuted = previewMasterMute.load();
+        const float prevMasterGain  = previewMasterGain.load();
         for (auto* stem : previewStems)
         {
             const auto& buf = stem->buffer;
             const auto  len = (juce::int64) buf.getNumSamples();
 
-            if (stem->mute.load() || pos >= len)
+            if (stem->mute.load() || prevMasterMuted || pos >= len)
             {
                 stem->level.store (0.0f);
                 continue;
             }
 
             const int n = (int) juce::jmin ((juce::int64) numSamples, len - pos);
-            const float gain = stem->gain.load();
+            const float gain = stem->gain.load() * prevMasterGain;
 
             const float* srcL = buf.getReadPointer (0, (int) pos);
             const float* srcR = buf.getNumChannels() > 1 ? buf.getReadPointer (1, (int) pos) : srcL;
 
-            juce::FloatVectorOperations::addWithMultiply (outL, srcL, gain, n);
-            if (outR != nullptr)
-                juce::FloatVectorOperations::addWithMultiply (outR, srcR, gain, n);
+            if (stem->fx.isBypassed() || fxBlockCapacity < n)
+            {
+                juce::FloatVectorOperations::addWithMultiply (outL, srcL, gain, n);
+                if (outR != nullptr)
+                    juce::FloatVectorOperations::addWithMultiply (outR, srcR, gain, n);
+            }
+            else
+            {
+                juce::FloatVectorOperations::copy (fxBlockL.getData(), srcL, n);
+                juce::FloatVectorOperations::copy (fxBlockR.getData(), srcR, n);
+                stem->fx.processStereo (fxBlockL.getData(), fxBlockR.getData(), n);
+                juce::FloatVectorOperations::addWithMultiply (outL, fxBlockL.getData(), gain, n);
+                if (outR != nullptr)
+                    juce::FloatVectorOperations::addWithMultiply (outR, fxBlockR.getData(), gain, n);
+            }
 
             const auto range = juce::FloatVectorOperations::findMinAndMax (srcL, n);
             stem->level.store (juce::jmax (std::abs (range.getStart()), std::abs (range.getEnd())) * gain);
@@ -912,7 +1053,8 @@ void HostMixEngine::audioDeviceIOCallbackWithContext (const float* const* inputC
             juce::FloatVectorOperations::clear (streamFeedR.getData(), numSamples);
         }
 
-        if (streamIncludeInput.load() && inL != nullptr)
+        // Capture mute keeps the host mic/instrument out of the VRChat feed.
+        if (streamIncludeInput.load() && inL != nullptr && ! hostCaptureMute.load())
         {
             const float g = hostInGain.load();
             juce::FloatVectorOperations::addWithMultiply (streamFeedL.getData(), inL, g, numSamples);
@@ -922,10 +1064,32 @@ void HostMixEngine::audioDeviceIOCallbackWithContext (const float* const* inputC
         streamOut.push (streamFeedL.getData(), streamFeedR.getData(), numSamples);
     }
 
+    // Preview recording: song mix + host input (unless capture-muted). Taken
+    // BEFORE the monitor passthrough, so what lands in the file does not
+    // depend on whether the host currently hears themselves.
+    if (st == State::idle && previewRecActive.load() && previewRecWriter != nullptr
+        && fxBlockCapacity >= numSamples)
+    {
+        juce::FloatVectorOperations::copy (fxBlockL.getData(), outL, numSamples);
+        juce::FloatVectorOperations::copy (fxBlockR.getData(), outR != nullptr ? outR : outL, numSamples);
+
+        if (inL != nullptr && ! hostCaptureMute.load())
+        {
+            const float g = hostInGain.load();
+            juce::FloatVectorOperations::addWithMultiply (fxBlockL.getData(), inL, g, numSamples);
+            juce::FloatVectorOperations::addWithMultiply (fxBlockR.getData(), inR, g, numSamples);
+        }
+
+        const float* chans[2] = { fxBlockL.getData(), fxBlockR.getData() };
+        previewRecWriter->write (chans, numSamples);
+        previewRecSamples.fetch_add (numSamples);
+    }
+
     // Host's own live input (talk mic / instrument): passed through to the
     // local output - even while no jam is running. The host plays along to
     // the (already delayed) mix they hear, so a plain live add is in time
-    // with that mix.
+    // with that mix. The mute here is the MONITOR mute: recording and the
+    // stream have their own capture mute above.
     if (inL != nullptr)
     {
         float peak = 0.0f;
@@ -945,14 +1109,6 @@ void HostMixEngine::audioDeviceIOCallbackWithContext (const float* const* inputC
     {
         hostInLevel.store (0.0f);
     }
-
-    // Preview recording: capture the finished local mix (what the host hears).
-    if (st == State::idle && previewRecActive.load() && previewRecWriter != nullptr)
-    {
-        const float* chans[2] = { outL, outR != nullptr ? outR : outL };
-        previewRecWriter->write (chans, numSamples);
-        previewRecSamples.fetch_add (numSamples);
-    }
 }
 
 void HostMixEngine::audioDeviceAboutToStart (juce::AudioIODevice* device)
@@ -970,6 +1126,10 @@ void HostMixEngine::audioDeviceAboutToStart (juce::AudioIODevice* device)
         hostInL.allocate ((size_t) block, true);
         hostInR.allocate ((size_t) block, true);
         hostInCapacity = block;
+
+        fxBlockL.allocate ((size_t) block, true);
+        fxBlockR.allocate ((size_t) block, true);
+        fxBlockCapacity = block;
 
         instrument.prepare (deviceRate, block);
 

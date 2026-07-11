@@ -167,6 +167,57 @@ bool SongLibrary::removeSong (const juce::String& songId)
     return false;
 }
 
+bool SongLibrary::renameSong (const juce::String& songId, const juce::String& newName)
+{
+    const auto trimmed = newName.trim();
+    if (trimmed.isEmpty())
+        return false;
+
+    for (auto& song : songs)
+    {
+        if (song.id == songId)
+        {
+            if (song.name == trimmed)
+                return true;   // nothing to do
+
+            song.name = trimmed;
+            saveManifest (song);
+            if (onChanged) onChanged();
+            return true;
+        }
+    }
+    return false;
+}
+
+bool SongLibrary::renameStem (const juce::String& songId, const juce::String& stemId,
+                              const juce::String& newName)
+{
+    const auto trimmed = newName.trim();
+    if (trimmed.isEmpty())
+        return false;
+
+    for (auto& song : songs)
+    {
+        if (song.id != songId)
+            continue;
+
+        for (auto& stem : song.stems)
+        {
+            if (stem.id == stemId)
+            {
+                if (stem.name == trimmed)
+                    return true;
+
+                stem.name = trimmed;
+                saveManifest (song);
+                if (onChanged) onChanged();
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 juce::var SongLibrary::toJson() const
 {
     juce::Array<juce::var> arr;

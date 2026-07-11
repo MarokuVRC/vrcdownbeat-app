@@ -44,6 +44,12 @@ public:
 
     bool removeSong (const juce::String& songId);
 
+    /** Renames keep the ids and files untouched, so musicians' downloads and
+        mix settings survive (the host broadcasts the new list via onChanged). */
+    bool renameSong (const juce::String& songId, const juce::String& newName);
+    bool renameStem (const juce::String& songId, const juce::String& stemId,
+                     const juce::String& newName);
+
     /** The client-facing JSON for the songList message. */
     juce::var toJson() const;
 

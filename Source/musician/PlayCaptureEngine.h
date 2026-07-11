@@ -6,6 +6,7 @@
 #include "common/SongLoader.h"
 #include "common/StreamOutput.h"
 #include "common/StreamingResampler.h"
+#include "common/ChannelFx.h"
 #include <atomic>
 #include <functional>
 
@@ -68,6 +69,18 @@ public:
     void         setStemGainDb (int index, float gainDb);
     void         setStemMute (int index, bool mute);
     float        getStemLevel (int index) const;
+
+    /** Per-stem EQ + effects, applied live at playback only - the RAM
+        buffers (and anything captured/sent to the host) stay raw. */
+    void       setStemFx (int index, const FxSettings& fx);
+    FxSettings getStemFx (int index) const;
+
+    // -- master volume over ALL stems (multiplies the per-stem gains, so the
+    //    balance between stems is kept) ----------------------------------------------
+    void  setStemMasterGainDb (float db) { stemMasterGain.store (juce::Decibels::decibelsToGain (db)); }
+    void  setStemMasterMute (bool mute)  { stemMasterMute.store (mute); }
+    float getStemMasterGainDb() const    { return juce::Decibels::gainToDecibels (stemMasterGain.load(), -40.0f); }
+    bool  getStemMasterMute() const      { return stemMasterMute.load(); }
 
     // -- VST instrument ------------------------------------------------------------
     bool loadInstrument (const juce::File& vst3File, juce::String& error);
@@ -151,6 +164,7 @@ private:
         std::atomic<float> gain  { 1.0f };
         std::atomic<bool>  mute  { false };
         std::atomic<float> level { 0.0f };     ///< post-gain peak while playing
+        ChannelFx fx;                          ///< live EQ/reverb (the buffer stays raw)
     };
 
     class SenderThread : public juce::Thread
@@ -195,6 +209,12 @@ private:
 
     juce::HeapBlock<float> instMono;               ///< scratch: instrument mono mix
     int instMonoCapacity { 0 };
+
+    juce::HeapBlock<float> fxL, fxR;               ///< scratch: per-stem fx processing
+    int fxCapacity { 0 };
+
+    std::atomic<float> stemMasterGain { 1.0f };
+    std::atomic<bool>  stemMasterMute { false };
 
     StreamOutput streamOut;                        ///< virtual-mic feed (VRChat etc.)
     std::atomic<bool> streamIncludeSong  { true };
